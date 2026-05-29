@@ -7,7 +7,14 @@ read-only role can reach). The SQLite backend is now test-only.
 
 from __future__ import annotations
 
-PROMPT_VERSION = "m5-v1"
+PROMPT_VERSION = "m6-v1"
+
+CONCEPT_EXTRACT_PROMPT_V1 = """\
+List the specific CLINICAL concepts named in the question that map to a coded value — a
+condition/diagnosis, a lab test or observation, a medication, or a procedure. Return ONLY
+a JSON array of short search phrases, e.g. ["type 2 diabetes","hemoglobin a1c"]. If the
+question names no such concept (it is a generic count / cost / demographic / utilization
+question), return []."""
 
 # Shared dialect/safety rules injected into the SQL prompts.
 _SQL_RULES = """\

@@ -22,6 +22,7 @@ class AgentState(BaseModel):
     # Working memory
     schema_snapshot: str | None = None          # rendered view/table schema shown to the model
     plan: str | None = None                      # short analysis from the plan node
+    code_hints: str | None = None                # exact codes resolved for named concepts
     candidate_sql: str | None = None             # current SQL to execute
     sql_attempts: list[str] = Field(default_factory=list)
     execution_result: dict[str, Any] | None = None  # {columns, rows, row_count, truncated}

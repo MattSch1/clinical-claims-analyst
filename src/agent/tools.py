@@ -161,6 +161,48 @@ def _sqlite_execute(query: str) -> dict:
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
+_STOPWORDS = {
+    "the", "a", "an", "of", "with", "and", "or", "in", "on", "for", "at", "least", "one",
+    "have", "has", "had", "patients", "patient", "diagnosis", "diagnosed", "who", "that",
+    "their", "by", "per", "each", "is", "are", "was", "were", "any", "all",
+}
+
+
+def _significant_words(term: str) -> list[str]:
+    toks = re.findall(r"[a-z0-9]+", term.lower())
+    return [t for t in toks if (len(t) >= 3 or t.isdigit()) and t not in _STOPWORDS]
+
+
+def lookup_codes(terms: list[str], *, per_term: int = 4) -> str:
+    """Resolve named clinical concepts to the EXACT codes present in the data (via a
+    description word-AND search across the coded views). Returns a hint block for the
+    SQL prompt, or "" if nothing matched / not on Postgres."""
+    if not get_settings().use_postgres or not terms:
+        return ""
+    lines: list[str] = []
+    for term in terms[:6]:
+        words = _significant_words(term)
+        if not words:
+            continue
+        try:
+            matches = pg.search_codes(words, per_view=per_term)
+        except Exception:  # noqa: BLE001 - a lookup miss must not break the request
+            matches = []
+        if not matches:
+            continue
+        # The single most-frequent match is the primary concept (a diagnosis outranks its
+        # "due to ..." complications); presenting just that keeps the cohort exact.
+        view, code, desc, _ = max(matches, key=lambda m: m[3])
+        lines.append(f'- "{term}" -> use {view} code = {code!r} ({desc})')
+    if not lines:
+        return ""
+    return (
+        "Exact codes resolved from the data for the concepts named in the question — "
+        "filter on these EXACT code value(s); do not guess a coding system or add "
+        "related/complication codes:\n" + "\n".join(lines)
+    )
+
+
 def extract_sql(text: str) -> str:
     """Pull a single SQL statement out of an LLM response (handles ``` fences,
     a leading 'SQL:' label, trailing prose, and stray semicolons)."""

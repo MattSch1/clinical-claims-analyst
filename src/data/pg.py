@@ -49,6 +49,35 @@ def view_columns(view: str) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
+# Clinical views with code+description columns, searched for concept→code resolution.
+_CODED_VIEWS = ("v_conditions", "v_observations", "v_procedures", "v_medications")
+
+
+def search_codes(words: list[str], *, per_view: int = 5) -> list[tuple[str, str, str, int]]:
+    """Find (view, code, description, count) rows whose description contains ALL `words`
+    (case-insensitive), most-frequent first, across the coded clinical views. Used to
+    resolve a named concept ("type 2 diabetes") to its exact code without guessing or
+    hardcoding. Word matching is parameterized (no SQL injection)."""
+    if not words:
+        return []
+    where = " AND ".join("description ILIKE %s" for _ in words)
+    params = [f"%{w}%" for w in words]
+    out: list[tuple[str, str, str, int]] = []
+    with psycopg.connect(_ro_dsn()) as conn:
+        for view in _CODED_VIEWS:
+            if view not in VIEW_ALLOWLIST:
+                continue
+            query = (
+                f'SELECT code, description, COUNT(*) AS n FROM "{view}" '
+                f"WHERE {where} AND code IS NOT NULL "
+                f"GROUP BY code, description ORDER BY n DESC LIMIT {int(per_view)}"
+            )
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                out.extend((view, r[0], r[1], int(r[2])) for r in cur.fetchall())
+    return out
+
+
 def distinct_values(view: str, column: str, *, limit: int = 40) -> list[str]:
     """Distinct values of a view column, to ground the model in real filter values."""
     if view not in VIEW_ALLOWLIST or not column.isidentifier():

@@ -20,12 +20,18 @@ leakage scanner), a domain-aware **eval harness**, full **observability**
 
 | Metric | Value |
 |---|---|
-| **Result-set accuracy** (vs gold SQL, 20 cases) | **~60–65%** (`m5-v1`, up from ~40–50% `m2-v1`: **+15–20 pts**) |
-| **…with model-routing** (`SQL_MODEL=gpt-4.1` for SQL gen) | **~75%** (15/20) — the spec's strong/cheap cost-accuracy lever |
-| **Self-correction recovery** | up to **3/3** first-attempt errors rescued |
-| **LLM-judge faithfulness** | mean **~4.1/5**, validated at **Cohen's κ = 1.0** vs human labels (target ≥ 0.70) |
+| **Result-set accuracy** (50 labeled cases, gold-SQL match) | **82%** (`gpt-4o-mini`, `m6-v1` + concept→code lookup) |
+| **…with model-routing** (`SQL_MODEL=gpt-4.1` for SQL gen) | **88%** (44/50) — the spec's strong/cheap cost-accuracy lever |
+| **Self-correction recovery** | **3/3** first-attempt errors rescued |
+| **LLM-judge faithfulness** | mean ~4/5, validated at **Cohen's κ = 1.0** vs human labels (target ≥ 0.70) |
 | **PHI leakage** | **0**, enforced in code + CI |
-| **Cost / query** | **~$0.0004** (cheap default) · **~$0.003** (routing on) · **p95 latency** ~6–10 s |
+| **Cost / query** | **~$0.0004** (cheap) · **~$0.003** (routed) · **p95 latency** ~10–16 s |
+
+Accuracy climbed **~40% → 88%** across M3→iterations via four measured levers — prompt
+revision, a **concept→code resolution** step (data-driven, not hardcoded — e.g. "Type 2
+diabetes" → SNOMED `44054006`), model-routing, and self-correction — on a **50-case**
+eval (grown from 20) spanning cost, utilization, clinical, pharmacy, quality-measure, and
+payer-mix questions.
 
 **The PHI-safe story (the scarce signal):** a de-identified-views boundary, a
 least-privilege DB role that **physically cannot read base tables or the date-shift key**,
@@ -81,10 +87,14 @@ on synthetic data, all real code. See *Methodology & safety architecture* below.
   PHI leakage still 0. A **second lever — model routing** (`SQL_MODEL=gpt-4.1` for SQL
   generation; plan/synthesize/judge stay on the cheap model) lifts accuracy to **~75%**
   (rate phrasing, per-patient subqueries, polypharmacy now pass) at ~8× cost — a real
-  cost/accuracy tradeoff; the cheap model stays the default. The remaining **exact
-  SNOMED/LOINC code-cohort** misses (q008/q014 — e.g. Type 2 diabetes `44054006` is rank
-  63 of 283 condition codes, too rare to surface by frequency) need a **code-lookup
-  step**, documented as future work rather than overfitting the prompt to the eval.
+  cost/accuracy tradeoff; the cheap model stays the default.
+- **Iteration — concept→code lookup + 50-case eval:** the exact SNOMED/LOINC cohort misses
+  (q008/q014 — Type 2 diabetes is rank 63 of 283 condition codes, too rare to ground by
+  frequency) are closed by a **`resolve_codes`** node: it extracts the clinical concepts
+  named in a question and resolves each to the single most-frequent matching code *in the
+  data* ("type 2 diabetes" → `44054006`) — data-driven, not hardcoded, no eval overfitting.
+  The eval set was grown **20 → 50** (all gold SQL validated against the views), giving the
+  headline **82% / 88%** above.
 
 - **M6 — ship:** a minimal **demo UI** at `GET /` (question → `/ask`, renders answer, SQL,
   cost, audit id, trace link), a **CI quality + PHI gate** (`.github/workflows/eval.yml`:

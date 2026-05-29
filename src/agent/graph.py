@@ -25,6 +25,7 @@ RECURSION_LIMIT = 30
 def build_graph():
     g = StateGraph(AgentState)
     g.add_node("plan", nodes.plan)
+    g.add_node("resolve_codes", nodes.resolve_codes)
     g.add_node("generate_sql", nodes.generate_sql)
     g.add_node("execute_sql", nodes.execute_sql)
     g.add_node("validate", nodes.validate)
@@ -32,7 +33,8 @@ def build_graph():
     g.add_node("synthesize", nodes.synthesize)
 
     g.add_edge(START, "plan")
-    g.add_edge("plan", "generate_sql")
+    g.add_edge("plan", "resolve_codes")
+    g.add_edge("resolve_codes", "generate_sql")
     g.add_edge("generate_sql", "execute_sql")
     g.add_edge("execute_sql", "validate")
     g.add_conditional_edges(

@@ -10,7 +10,9 @@ under one per-request trace.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 
 from src.agent import prompts, tools
 from src.agent.state import AgentState
@@ -145,11 +147,44 @@ def plan(state: AgentState) -> dict:
         }
 
 
+def _parse_terms(text: str) -> list[str]:
+    match = re.search(r"\[.*\]", text or "", re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            return [str(t) for t in data if isinstance(t, str)][:6]
+        except (ValueError, TypeError):
+            pass
+    return []
+
+
+def resolve_codes(state: AgentState) -> dict:
+    """Resolve named clinical concepts (e.g. 'Type 2 diabetes') to the EXACT codes present
+    in the data via a description lookup — so the agent uses the real SNOMED/LOINC code
+    rather than guessing a coding system. No-op on the SQLite backend / when no concept."""
+    if not settings.use_postgres:
+        return {"code_hints": None}
+    try:
+        res = _run_llm("resolve_codes", prompts.CONCEPT_EXTRACT_PROMPT_V1, f"Question: {state.question}")
+        terms = _parse_terms(res.text)
+        hints = tools.lookup_codes(terms) if terms else ""
+        note = f"resolve_codes: {terms} -> {'codes found' if hints else 'none'}"
+        return {
+            "code_hints": hints or None,
+            "step_trace": state.step_trace + [note],
+            **_acc(state, res),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("resolve_codes failed", exc_info=True)
+        return {"code_hints": None, "step_trace": state.step_trace + [f"resolve_codes failed: {exc}"]}
+
+
 def generate_sql(state: AgentState) -> dict:
     schema = state.schema_snapshot or tools.schema_inspect()
+    hints = f"\n\n{state.code_hints}" if state.code_hints else ""
     user = (
         f"Schema:\n{schema}\n\nQuestion: {state.question}\n\n"
-        f"Approach: {state.plan or '(none)'}\n\nWrite the SQL."
+        f"Approach: {state.plan or '(none)'}{hints}\n\nWrite the SQL."
     )
     try:
         res = _run_llm(
@@ -219,10 +254,11 @@ def self_correct(state: AgentState) -> dict:
     # Scrub the DB error before it enters a prompt — it's the one prompt input not
     # produced by the de-identified views and could echo a literal from the query.
     db_error = scrub.scrub(state.execution_error or "query returned no rows")
+    hints = f"{state.code_hints}\n\n" if state.code_hints else ""
     user = (
         f"Schema:\n{schema}\n\nQuestion: {state.question}\n\n"
         f"Failed SQL:\n{state.candidate_sql or '(none)'}\n\n"
-        f"Database error / problem: {db_error}\n\n"
+        f"Database error / problem: {db_error}\n\n{hints}"
         "Return the corrected SQL."
     )
     try:
