@@ -1,0 +1,252 @@
+"""The six agent nodes (spec §8):
+
+    plan -> generate_sql -> execute_sql -> validate -> (self_correct | synthesize)
+
+Hard rules honored here: every node try/excepts and records to state (never raises
+out, so the request never 500s); self-correction is capped at MAX_RETRIES then the
+agent degrades gracefully; each model call and the SQL tool call is traced to Langfuse
+under one per-request trace.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from src.agent import prompts, tools
+from src.agent.state import AgentState
+from src.config import get_settings
+from src.llm import client as llm
+from src.obs import tracing
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
+
+MAX_RETRIES = 3  # self-correction cap (CLAUDE.md hard rule)
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def _clip(text: str, n: int = 160) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[:n] + "…"
+
+
+def _acc(state: AgentState, res: llm.LLMResult) -> dict:
+    """Accumulate cost/tokens onto the running state."""
+    return {
+        "total_cost_usd": round(state.total_cost_usd + res.cost_usd, 8),
+        "total_tokens": state.total_tokens + res.total_tokens,
+    }
+
+
+def _run_llm(node: str, system: str, user: str) -> llm.LLMResult:
+    """One model call, traced as a child generation of the request's trace."""
+    with tracing.generation(
+        name=node, model=settings.llm_model, input=user, tags=["m1", node]
+    ) as box:
+        res = llm.complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        )
+        box["output"] = res.text
+        box["usage_details"] = {
+            "input": res.prompt_tokens,
+            "output": res.completion_tokens,
+            "total": res.total_tokens,
+        }
+        box["cost_details"] = {"total": res.cost_usd}
+    return res
+
+
+def _render_result(result: dict, max_rows: int = 50) -> str:
+    cols = result.get("columns", [])
+    rows = result.get("rows", [])[:max_rows]
+    header = " | ".join(str(c) for c in cols)
+    body = "\n".join(" | ".join("" if v is None else str(v) for v in row) for row in rows)
+    extra = "\n… (more rows omitted)" if result.get("truncated") else ""
+    return f"{header}\n{body}{extra}"
+
+
+def _has_data(result: dict | None) -> bool:
+    """A result is a real answer only if it has rows AND isn't a single all-NULL
+    aggregate row (e.g. AVG/rate over a filter that matched nothing) — otherwise the
+    model would happily narrate a fabricated number over a NULL."""
+    if not result:
+        return False
+    rows = result.get("rows") or []
+    if not rows:
+        return False
+    if len(rows) == 1 and all(v is None for v in rows[0]):
+        return False
+    return True
+
+
+def _fallback_answer(state: AgentState) -> str:
+    res = state.execution_result or {}
+    cols = res.get("columns", [])
+    rows = res.get("rows", [])
+    head = rows[0] if rows else []
+    pairs = ", ".join(f"{c}={v}" for c, v in zip(cols, head, strict=False))
+    return f"Result ({state.row_count} row(s)): {pairs}" if pairs else "Query returned no rows."
+
+
+# ── nodes ─────────────────────────────────────────────────────────────────────
+def plan(state: AgentState) -> dict:
+    schema = state.schema_snapshot or tools.schema_inspect()
+    try:
+        res = _run_llm(
+            "plan",
+            prompts.PLAN_PROMPT_V1,
+            f"Schema:\n{schema}\n\nQuestion: {state.question}",
+        )
+        return {
+            "schema_snapshot": schema,
+            "plan": res.text.strip(),
+            "step_trace": state.step_trace + [f"plan: {_clip(res.text)}"],
+            **_acc(state, res),
+        }
+    except Exception as exc:  # noqa: BLE001 - never let a node crash the request
+        logger.warning("plan node failed", exc_info=True)
+        return {
+            "schema_snapshot": schema,
+            "plan": None,
+            "step_trace": state.step_trace + [f"plan failed: {exc}"],
+        }
+
+
+def generate_sql(state: AgentState) -> dict:
+    schema = state.schema_snapshot or tools.schema_inspect()
+    user = (
+        f"Schema:\n{schema}\n\nQuestion: {state.question}\n\n"
+        f"Approach: {state.plan or '(none)'}\n\nWrite the SQL."
+    )
+    try:
+        res = _run_llm("generate_sql", prompts.SQL_GENERATE_PROMPT_V1, user)
+        sql = tools.extract_sql(res.text)
+        return {
+            "candidate_sql": sql,
+            "sql_attempts": state.sql_attempts + [sql],
+            "execution_error": None,
+            "step_trace": state.step_trace + [f"generate_sql: {_clip(sql)}"],
+            **_acc(state, res),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("generate_sql node failed", exc_info=True)
+        return {
+            "candidate_sql": None,
+            "execution_error": f"sql generation failed: {exc}",
+            "step_trace": state.step_trace + [f"generate_sql failed: {exc}"],
+        }
+
+
+def execute_sql(state: AgentState) -> dict:
+    sql = state.candidate_sql
+    if not sql:
+        return {
+            "execution_result": None,
+            "execution_error": state.execution_error or "no SQL to execute",
+            "step_trace": state.step_trace + ["execute_sql: skipped (no SQL)"],
+        }
+    with tracing.tool(name="sql_execute", input=sql) as box:
+        result = tools.sql_execute(sql)  # guarded, read-only; never raises
+        if "error" in result:
+            box["output"] = {"error": result["error"]}
+            return {
+                "execution_result": None,
+                "execution_error": result["error"],
+                "step_trace": state.step_trace + [f"execute_sql error: {_clip(result['error'])}"],
+            }
+        box["output"] = {"row_count": result["row_count"], "columns": result["columns"]}
+        return {
+            "execution_result": result,
+            "execution_error": None,
+            "step_trace": state.step_trace + [f"execute_sql: {result['row_count']} rows"],
+        }
+
+
+def validate(state: AgentState) -> dict:
+    """Branch node: decide self_correct vs synthesize (sets state.route)."""
+    err = state.execution_error
+    rows = state.row_count
+    if err is None and _has_data(state.execution_result):
+        route, status = "synthesize", ("recovered" if state.retry_count > 0 else "ok")
+    elif state.retry_count >= MAX_RETRIES:
+        route, status = "synthesize", ("failed" if err else "empty")
+    else:
+        route, status = "self_correct", "retrying"
+    note = (
+        f"validate: -> {route} (error={bool(err)}, rows={rows}, "
+        f"retry={state.retry_count}/{MAX_RETRIES})"
+    )
+    return {"route": route, "status": status, "step_trace": state.step_trace + [note]}
+
+
+def self_correct(state: AgentState) -> dict:
+    schema = state.schema_snapshot or tools.schema_inspect()
+    user = (
+        f"Schema:\n{schema}\n\nQuestion: {state.question}\n\n"
+        f"Failed SQL:\n{state.candidate_sql or '(none)'}\n\n"
+        f"Database error / problem: {state.execution_error or 'query returned no rows'}\n\n"
+        "Return the corrected SQL."
+    )
+    try:
+        res = _run_llm("self_correct", prompts.SELF_CORRECT_PROMPT_V1, user)
+        sql = tools.extract_sql(res.text)
+        note = f"self_correct #{state.retry_count + 1}: {_clip(sql)}"
+        return {
+            "candidate_sql": sql,
+            "sql_attempts": state.sql_attempts + [sql],
+            "retry_count": state.retry_count + 1,
+            "execution_error": None,
+            "step_trace": state.step_trace + [note],
+            **_acc(state, res),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("self_correct node failed", exc_info=True)
+        return {
+            "retry_count": state.retry_count + 1,  # still advance so the loop terminates
+            "step_trace": state.step_trace + [f"self_correct failed: {exc}"],
+        }
+
+
+def synthesize(state: AgentState) -> dict:
+    if _has_data(state.execution_result):
+        user = (
+            f"Question: {state.question}\n\nSQL that was run:\n{state.candidate_sql}\n\n"
+            f"Result columns: {state.execution_result.get('columns')}\n"
+            f"Result rows ({state.row_count}):\n{_render_result(state.execution_result)}"
+        )
+        try:
+            res = _run_llm("synthesize", prompts.SYNTHESIZE_PROMPT_V1, user)
+            status = state.status if state.status in ("ok", "recovered") else "ok"
+            return {
+                "final_answer": res.text.strip(),
+                "status": status,
+                "step_trace": state.step_trace + ["synthesize: answered"],
+                **_acc(state, res),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("synthesize node failed; using templated answer", exc_info=True)
+            return {
+                "final_answer": _fallback_answer(state),
+                "status": "ok",
+                "step_trace": state.step_trace + [f"synthesize failed, templated: {exc}"],
+            }
+
+    # Graceful degradation — no data or unrecovered error.
+    if state.execution_error:
+        msg = (
+            "I couldn't determine an answer from the available data "
+            f"(last database error: {state.execution_error})."
+        )
+        status = "failed"
+    else:
+        msg = "I couldn't determine an answer — the query returned no rows."
+        status = "empty"
+    return {
+        "final_answer": msg,
+        "status": status,
+        "step_trace": state.step_trace + ["synthesize: graceful (no answer)"],
+    }
+
+
+def route_after_validate(state: AgentState) -> str:
+    return state.route or "synthesize"

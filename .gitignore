@@ -1,0 +1,41 @@
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ── Secrets / local env ─────────────────────────────────────────────────────
+.env
+.env.local
+*.local
+
+# ── Synthetic data artifacts (regenerable via `python -m src.data.load`) ─────
+/data/*.db
+/data/*.sqlite
+/data/*.sqlite3
+/data/synthea_csv/
+/data/synthea_out/
+/.synthea/
+output/
+
+# ── Synthea generator jar (downloaded on demand, large, not source) ──────────
+*.jar
+
+# ── Generated eval reports ───────────────────────────────────────────────────
+/eval/reports/*.json
+/eval/reports/*.md
+
+# ── Docker / local volumes ───────────────────────────────────────────────────
+/.volumes/
+
+# ── OS / editor cruft ────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/

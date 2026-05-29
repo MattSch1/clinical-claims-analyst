@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clinical-claims-analyst"
+version = "0.1.0"
+description = "PHI-safe text-to-analytics agent over a synthetic claims+clinical dataset (Synthea)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Matthew Schmale" }]
+
+# Versions pinned to the latest mutually-compatible releases as of 2026-05.
+# Key constraint: langfuse 4.x is the OpenTelemetry-based SDK; LiteLLM's *native*
+# `langfuse` callback only supports langfuse v2, so we instrument with the
+# Langfuse v4 SDK directly (see src/obs/tracing.py) rather than that callback.
+dependencies = [
+    "fastapi==0.136.3",
+    "uvicorn[standard]==0.48.0",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.14.1",
+    "python-dotenv==1.2.2",
+    "httpx==0.28.1",
+    "litellm==1.86.2",
+    "langfuse==4.7.0",
+    # Agent orchestration — pinned now (declared dependency), first used in M1.
+    # langchain-core is pinned to the floor langgraph 1.2.2 requires; let pip
+    # resolve langgraph-checkpoint / langgraph-prebuilt from langgraph's own pins.
+    "langgraph==1.2.2",
+    "langchain-core==1.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.15.15",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# E/F/W pycodestyle+pyflakes, I import-sort, UP pyupgrade, B bugbear, S bandit
+# (security signal fits this project).
+select = ["E", "F", "W", "I", "UP", "B", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]          # asserts are the point of tests
+"src/data/load.py" = ["S608"]  # CREATE TABLE built from CSV headers (synthetic, trusted)
+"src/data/db.py" = ["S608"]    # PRAGMA built from trusted sqlite_master table names
+"scripts/**" = ["S101"]
+# Starter file (provided; wired at M2) — its str+Enum is intentional, leave as-is.
+"src/phi/classification.py" = ["UP042"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+asyncio_mode = "auto"

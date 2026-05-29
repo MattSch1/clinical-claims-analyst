@@ -1,0 +1,236 @@
+# ============================================================================
+# Local dev stack: Postgres + Langfuse (self-hosted v3) + the app.
+#
+# Langfuse v3 is a multi-container appliance (web, worker, postgres, clickhouse,
+# redis, minio). It brings its OWN postgres for config/metadata. The clinical /
+# claims dataset lives in a SEPARATE `analytics-postgres` (defined here, WIRED IN
+# M2 — the app uses SQLite in M0 and does not touch it yet). Keeping telemetry and
+# clinical data in different databases is part of the PHI-safe separation story.
+#
+# All secrets below come from a gitignored `.env` (see .env.example). The inline
+# defaults are insecure throwaway placeholders — override every one of them.
+#
+# Image pins: langfuse web+worker MUST share a version. We pin 3.175.0 because the
+# langfuse-worker:3.176.0 image was not published to Docker Hub at scaffold time
+# (only the web image was). Bump both together after confirming the worker tag
+# exists: https://hub.docker.com/r/langfuse/langfuse-worker/tags
+# Based on github.com/langfuse/langfuse/blob/main/docker-compose.yml.
+# ============================================================================
+services:
+  # ── Application (FastAPI + LiteLLM) ─────────────────────────────────────────
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      # langfuse-web has no healthcheck; service_started is the strongest valid
+      # condition. Tracing degrades gracefully if Langfuse isn't ready yet.
+      langfuse-web:
+        condition: service_started
+    environment:
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-true}
+      # In-network ingest host (NOT localhost — that would be the app container).
+      LANGFUSE_HOST: http://langfuse-web:3000
+      # Browser-facing URL for clickable trace links returned by /ask.
+      LANGFUSE_PUBLIC_URL: ${LANGFUSE_PUBLIC_URL:-http://localhost:3000}
+      # App keys are the headless-seeded project keys (kept in sync automatically).
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-pk-lf-0000000000000000}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-sk-lf-0000000000000000}
+      LANGFUSE_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-clinical-claims-analyst}
+    ports:
+      - 8000:8000
+
+  # ── Analytics Postgres: clinical/claims dataset (WIRED IN M2; idle in M0) ────
+  analytics-postgres:
+    image: docker.io/postgres:17
+    restart: always
+    environment:
+      POSTGRES_USER: ${ANALYTICS_POSTGRES_USER:-analytics}
+      POSTGRES_PASSWORD: ${ANALYTICS_POSTGRES_PASSWORD:-analytics}
+      POSTGRES_DB: ${ANALYTICS_POSTGRES_DB:-analytics}
+      TZ: UTC
+      PGTZ: UTC
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ANALYTICS_POSTGRES_USER:-analytics}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - 127.0.0.1:5433:5432   # host 5433 to avoid clashing with Langfuse's pg on 5432
+    volumes:
+      - analytics_postgres_data:/var/lib/postgresql/data
+
+  # ── Langfuse worker ─────────────────────────────────────────────────────────
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:3.175.0
+    restart: always
+    depends_on: &langfuse-depends-on
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1:3030:3030
+    environment: &langfuse-worker-env
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/postgres}
+      SALT: ${SALT:-CHANGEME-run-openssl-rand-base64-32}                        # must match web; openssl rand -base64 32
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}  # must match web; openssl rand -hex 32 (EXACTLY 64 hex)
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-true}
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}
+      CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-false}
+      LANGFUSE_USE_AZURE_BLOB: ${LANGFUSE_USE_AZURE_BLOB:-false}
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
+      # S3 creds are tied to the MinIO root creds (single knob) so they can't drift.
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE:-true}
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: ${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+      # Shared via anchor -> both web AND worker get localhost:9090 (matches upstream).
+      # MEDIA endpoint is baked into presigned URLs the browser fetches, so it must
+      # be host-reachable (host 9090 -> container 9000).
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://localhost:9090}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: ${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: ${LANGFUSE_S3_BATCH_EXPORT_ENABLED:-false}
+      LANGFUSE_S3_BATCH_EXPORT_BUCKET: ${LANGFUSE_S3_BATCH_EXPORT_BUCKET:-langfuse}
+      LANGFUSE_S3_BATCH_EXPORT_PREFIX: ${LANGFUSE_S3_BATCH_EXPORT_PREFIX:-exports/}
+      LANGFUSE_S3_BATCH_EXPORT_REGION: ${LANGFUSE_S3_BATCH_EXPORT_REGION:-auto}
+      LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: ${LANGFUSE_S3_BATCH_EXPORT_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: ${LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT:-http://localhost:9090}
+      LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+      LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: ${LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE:-true}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_AUTH: ${REDIS_AUTH:-CHANGEME-redis-password}
+      REDIS_TLS_ENABLED: ${REDIS_TLS_ENABLED:-false}
+
+  # ── Langfuse web (UI + ingestion + REST API) ────────────────────────────────
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:3.175.0
+    restart: always
+    depends_on: *langfuse-depends-on
+    ports:
+      - 3000:3000
+    environment:
+      <<: *langfuse-worker-env
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-CHANGEME-run-openssl-rand-base64-32}
+      # Headless init: auto-creates org/project/user + FIXED API keys on FIRST boot
+      # only (read ONLY by langfuse-web). Re-seed via `docker compose down -v`.
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-clinical-claims-org}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Clinical Claims Analyst}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-clinical-claims-analyst}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-clinical-claims-analyst}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-pk-lf-0000000000000000}  # must start pk-lf-
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-sk-lf-0000000000000000}  # must start sk-lf-
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@example.com}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-CHANGEME-min-8-chars}  # min 8 chars
+
+  # ── Langfuse infrastructure ─────────────────────────────────────────────────
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.3   # Langfuse requires >= 24.3
+    restart: always
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    ports:
+      - 127.0.0.1:8123:8123
+      - 127.0.0.1:9000:9000
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  minio:
+    image: docker.io/minio/minio:RELEASE.2025-04-08T15-41-24Z   # ships `mc` so the healthcheck works
+    restart: always
+    entrypoint: sh
+    # Pre-create the 'langfuse' bucket (Langfuse does NOT create S3 buckets itself).
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}            # must equal LANGFUSE_S3_*_ACCESS_KEY_ID
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}  # >= 8 chars; must equal LANGFUSE_S3_*_SECRET_ACCESS_KEY
+    ports:
+      - 9090:9000
+      - 127.0.0.1:9091:9001
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+  redis:
+    image: docker.io/redis:7.4
+    restart: always
+    command: >
+      --requirepass ${REDIS_AUTH:-CHANGEME-redis-password}
+      --maxmemory-policy noeviction
+    ports:
+      - 127.0.0.1:6379:6379
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  postgres:
+    image: docker.io/postgres:17
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - 127.0.0.1:5432:5432
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  langfuse_postgres_data:
+    driver: local
+  langfuse_clickhouse_data:
+    driver: local
+  langfuse_clickhouse_logs:
+    driver: local
+  langfuse_minio_data:
+    driver: local
+  langfuse_redis_data:
+    driver: local
+  analytics_postgres_data:
+    driver: local
