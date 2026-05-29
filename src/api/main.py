@@ -17,17 +17,28 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from src.agent.graph import run_agent
+from src.api.ratelimit import RateLimiter
 from src.config import get_settings
 from src.obs import tracing
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 settings = get_settings()
+_limiter = RateLimiter(
+    per_minute=settings.rate_limit_per_min, per_day_total=settings.max_queries_per_day
+)
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:  # behind Render/Fly proxy — first hop is the real client
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 @asynccontextmanager
@@ -101,7 +112,13 @@ def health() -> dict:
 
 
 @app.post("/ask", response_model=AskResponse)
-def ask(req: AskRequest) -> AskResponse:
+def ask(req: AskRequest, request: Request) -> AskResponse:
+    # Rate limit BEFORE any model call so a public URL can't drain the key (429).
+    if _limiter.enabled:
+        allowed, reason = _limiter.check(_client_ip(request), now=time.time())
+        if not allowed:
+            raise HTTPException(status_code=429, detail=reason)
+
     # Without a model (and not mocking), don't pretend — return a clear message.
     if not settings.llm_ready and not settings.llm_mock:
         return AskResponse(

@@ -13,6 +13,11 @@ services:
     envVars:
       - key: DATA_BACKEND
         value: postgres
+      # Public-URL guardrails: bound token spend (per-IP/min + global daily cap → 429).
+      - key: RATE_LIMIT_PER_MIN
+        value: "10"
+      - key: MAX_QUERIES_PER_DAY
+        value: "500"
       - key: OPENAI_API_KEY
         sync: false
       - key: ANALYTICS_OWNER_DSN

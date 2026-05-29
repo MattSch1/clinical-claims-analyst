@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     # ── App ──────────────────────────────────────────────────────────────────
     app_name: str = "clinical-claims-analyst"
     environment: str = Field(default="local", alias="ENVIRONMENT")
+    # Public-deploy guardrails for /ask (0 = disabled). Bound token spend on a public URL.
+    rate_limit_per_min: int = Field(default=0, alias="RATE_LIMIT_PER_MIN")
+    max_queries_per_day: int = Field(default=0, alias="MAX_QUERIES_PER_DAY")
 
     # ── LLM (via LiteLLM) ──────────────────────────────────────────────────────
     # `llm_model` is a LiteLLM model string, e.g. "gpt-4o-mini", "openai/gpt-4o".

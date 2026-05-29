@@ -108,6 +108,13 @@
           body: JSON.stringify({ question }),
         });
         const d = await res.json();
+        if (!res.ok) {
+          answerEl.className = "answer err";
+          answerEl.textContent = d.detail || ("Request failed (HTTP " + res.status + ")");
+          sqlEl.style.display = "none"; metaEl.innerHTML = ""; traceEl.textContent = "";
+          card.style.display = "block";
+          return;
+        }
         answerEl.className = "answer";
         answerEl.textContent = d.answer || "(no answer)";
         sqlEl.style.display = d.sql ? "block" : "none";

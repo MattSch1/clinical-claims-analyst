@@ -260,21 +260,28 @@ where optimization (M5) was aimed.
 
 ## Deploy
 
-The app is a stateless container; production needs a **managed Postgres** (bootstrap the
-views into it once), **Langfuse** (self-hosted or [Cloud](https://cloud.langfuse.com)),
-and an `OPENAI_API_KEY`. A Render blueprint is in [`render.yaml`](./render.yaml); the
-container honors `$PORT`.
+The app is a stateless container; production needs a **managed Postgres** (Neon/Supabase
+free tier works — bootstrap the views into it once), **Langfuse Cloud** free tier (avoids
+self-hosting ClickHouse), and an `OPENAI_API_KEY`. A Render blueprint is in
+[`render.yaml`](./render.yaml); the container honors `$PORT`.
 
 ```bash
-# 1. Provision managed Postgres + set the DSNs/role passwords + Langfuse + OPENAI_API_KEY
-#    as service env vars (see render.yaml / .env.example). Then, once, against that DB:
-DATA_BACKEND=postgres python -m src.data.bootstrap_pg   # creates views, analyst_ro, audit
-# 2. Deploy the Docker service (Render/Fly/any container host). Health check: GET /health.
+# 1. Provision managed Postgres + Langfuse Cloud project. Then bootstrap the cloud DB ONCE
+#    from your machine (needs Java for Synthea) — generates data + views + roles + audit:
+ANALYTICS_OWNER_DSN='postgresql://…managed PG…' \
+ANALYST_RO_PASSWORD='…' AUDIT_WRITER_PASSWORD='…' \
+  python scripts/bootstrap_cloud.py
+# 2. Deploy the Docker service (Render/Fly/any container host) with the env vars/secrets
+#    from render.yaml / .env.example. Health check: GET /health.
 # 3. Open the service URL → the demo UI at GET /.
 ```
 
-The reachable URL is the operator's step (it needs your cloud account + secrets); the repo
-is deploy-ready and runs end-to-end locally via `docker compose up -d --build`.
+**Public-URL guardrails (built in):** set `RATE_LIMIT_PER_MIN` (per-IP/min) and
+`MAX_QUERIES_PER_DAY` (global) so `/ask` returns **HTTP 429** before any model call —
+plus set a **monthly spending cap on the OpenAI key** — so a public URL can't drain it.
+Data is synthetic and only aggregates are returned, so the demo itself is safe to expose;
+the only risk is token spend, which these bound. The reachable URL is the operator's step
+(cloud account + secrets); the repo runs end-to-end locally via `docker compose up -d --build`.
 
 ---
 

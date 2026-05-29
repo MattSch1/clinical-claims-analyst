@@ -165,7 +165,9 @@ def resolve_codes(state: AgentState) -> dict:
     if not settings.use_postgres:
         return {"code_hints": None}
     try:
-        res = _run_llm("resolve_codes", prompts.CONCEPT_EXTRACT_PROMPT_V1, f"Question: {state.question}")
+        res = _run_llm(
+            "resolve_codes", prompts.CONCEPT_EXTRACT_PROMPT_V1, f"Question: {state.question}"
+        )
         terms = _parse_terms(res.text)
         hints = tools.lookup_codes(terms) if terms else ""
         note = f"resolve_codes: {terms} -> {'codes found' if hints else 'none'}"
@@ -176,7 +178,8 @@ def resolve_codes(state: AgentState) -> dict:
         }
     except Exception as exc:  # noqa: BLE001
         logger.warning("resolve_codes failed", exc_info=True)
-        return {"code_hints": None, "step_trace": state.step_trace + [f"resolve_codes failed: {exc}"]}
+        note = f"resolve_codes failed: {exc}"
+        return {"code_hints": None, "step_trace": state.step_trace + [note]}
 
 
 def generate_sql(state: AgentState) -> dict:
