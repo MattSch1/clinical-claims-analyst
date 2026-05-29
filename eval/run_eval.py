@@ -23,8 +23,9 @@ import statistics  # noqa: E402
 import time  # noqa: E402
 from datetime import UTC, datetime  # noqa: E402
 
+import judge  # noqa: E402  (eval/ is on sys.path as the script dir)
 import psycopg  # noqa: E402
-import scorers  # noqa: E402  (eval/ is on sys.path as the script dir)
+import scorers  # noqa: E402
 
 from src.agent.graph import run_agent  # noqa: E402
 from src.agent.prompts import PROMPT_VERSION  # noqa: E402
@@ -83,6 +84,11 @@ def main() -> int:
         leaks = list(state.leakage_hits) + [
             f"answer:{lk.kind}" for lk in leakage.scan_text(state.final_answer or "")
         ]
+        # Secondary scorer: LLM judge rates the answer's faithfulness (validated at
+        # kappa via eval/judge_validation.py).
+        verdict = judge.judge_answer(
+            case["question"], state.candidate_sql, agent_result, state.final_answer or ""
+        )
         per_case.append({
             "id": case["id"],
             "difficulty": case.get("difficulty"),
@@ -93,6 +99,7 @@ def main() -> int:
             "self_corrections": state.retry_count,
             "latency_ms": round(latency_ms, 1),
             "cost_usd": round(state.total_cost_usd, 6),
+            "judge_score": verdict["score"],
             "leakage": leaks,
             "agent_sql": state.candidate_sql,
             "gold_error": gold_error,
@@ -105,6 +112,7 @@ def main() -> int:
     first_errors = [r for r in per_case if r["self_corrections"] > 0]
     recovered = [r for r in first_errors if r["matched"] or r["status"] in ("ok", "recovered")]
     latencies = [r["latency_ms"] for r in per_case]
+    judge_scores = [r["judge_score"] for r in per_case if r["judge_score"] > 0]
 
     by_diff: dict[str, list[bool]] = {}
     by_tag: dict[str, list[bool]] = {}
@@ -127,6 +135,8 @@ def main() -> int:
         "mean_cost_usd": round(sum(r["cost_usd"] for r in per_case) / n, 6) if n else 0.0,
         "total_cost_usd": round(sum(r["cost_usd"] for r in per_case), 6),
         "phi_leakage_count": sum(len(r["leakage"]) for r in per_case),
+        "mean_judge_score": round(statistics.mean(judge_scores), 2) if judge_scores else 0.0,
+        "judge_version": judge.JUDGE_VERSION,
         "accuracy_by_difficulty": {k: f"{sum(v)}/{len(v)}" for k, v in sorted(by_diff.items())},
         "accuracy_by_tag": {k: f"{sum(v)}/{len(v)}" for k, v in sorted(by_tag.items())},
         "cases": per_case,
@@ -158,6 +168,8 @@ def _render_md(r: dict) -> str:
         f"- **Latency:** p50 {r['p50_latency_ms']:.0f} ms · p95 {r['p95_latency_ms']:.0f} ms",
         f"- **Cost:** ${r['mean_cost_usd']:.5f}/query (${r['total_cost_usd']:.4f} total)",
         f"- **PHI leakage:** {r['phi_leakage_count']} (target 0)",
+        f"- **Mean judge score:** {r['mean_judge_score']}/5 (`{r['judge_version']}`, "
+        "faithfulness; validated separately via judge_validation.py)",
         "",
         "## Accuracy by difficulty",
         *[f"- {k}: {v}" for k, v in r["accuracy_by_difficulty"].items()],

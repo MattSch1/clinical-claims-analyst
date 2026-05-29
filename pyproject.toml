@@ -61,7 +61,8 @@ select = ["E", "F", "W", "I", "UP", "B", "S"]
 "src/data/bootstrap_pg.py" = ["S608"] # DDL composed from trusted constants
 "src/data/pg.py" = ["S608"]           # view/column validated against the allow-list first
 "scripts/**" = ["S101"]
-"eval/run_eval.py" = ["E402"]  # sys.path bootstrap precedes imports (run as a script)
+"eval/run_eval.py" = ["E402"]          # sys.path bootstrap precedes imports (run as a script)
+"eval/judge_validation.py" = ["E402"]  # same sys.path bootstrap
 # Starter file (provided; wired at M2) — its str+Enum is intentional, leave as-is.
 "src/phi/classification.py" = ["UP042"]
 

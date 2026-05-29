@@ -16,7 +16,7 @@ leakage scanner), a domain-aware **eval harness**, full **observability**
 
 ---
 
-## Status: Milestone M3 (eval harness) ✅
+## Status: Milestone M4 (validated LLM judge) ✅
 
 - **M0 — skeleton:** repo scaffold (§7), pinned deps, Docker Compose (self-hosted
   Langfuse v3 stack + Postgres + app), Synthea→SQLite loader, FastAPI `/health` +
@@ -45,13 +45,20 @@ leakage scanner), a domain-aware **eval harness**, full **observability**
   misses cluster into clear optimization levers for M5 (code-vs-description grouping,
   ICD-10-vs-SNOMED code grounding, rate/join phrasing).
 
+- **M4 — validated LLM judge:** a rubric-based faithfulness judge (`eval/judge.py`,
+  1–5) scores how well each answer reflects its query result, run as the eval's
+  secondary scorer (mean ~4.1/5). Crucially, the judge is **validated against human
+  labels** (`eval/judge_validation.py`, `eval/judge_labels.jsonl`): **Cohen's
+  κ = 1.0** on the binary faithful decision (target ≥ 0.70), 79% exact 1–5 agreement.
+  The judge (faithfulness) and result-set match (correctness) **decouple** — the agent
+  often *faithfully* reports a *wrong-SQL* result — which is precisely the M5 target.
+
 The PHI controls are layered defense-in-depth — the **DB grant is the primary control**
 (the agent's role physically cannot read a base table), with code-level guards
 (`assert_views_only`, `assert_aggregate_shape`, `assert_safe_output_columns`) as a fast,
 structured second line.
 
-Not yet built (deliberately): judge validation (M4), optimization (M5), CI gate + deploy
-(M6). Those modules exist as honest placeholders.
+Not yet built (deliberately): optimization (M5) and the CI gate + deploy (M6).
 
 ### Verified end-to-end (M2)
 
