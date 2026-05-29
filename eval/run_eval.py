@@ -126,6 +126,7 @@ def main() -> int:
         "timestamp": datetime.now(UTC).isoformat(),
         "prompt_version": PROMPT_VERSION,
         "model": settings.llm_model,
+        "sql_model": settings.sql_model_resolved,
         "n_cases": n,
         "result_set_accuracy": round(matched_n / n, 3) if n else 0.0,
         "execution_success_rate": round(sum(r["executed"] for r in per_case) / n, 3) if n else 0.0,

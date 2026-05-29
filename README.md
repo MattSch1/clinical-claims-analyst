@@ -21,10 +21,11 @@ leakage scanner), a domain-aware **eval harness**, full **observability**
 | Metric | Value |
 |---|---|
 | **Result-set accuracy** (vs gold SQL, 20 cases) | **~60–65%** (`m5-v1`, up from ~40–50% `m2-v1`: **+15–20 pts**) |
+| **…with model-routing** (`SQL_MODEL=gpt-4.1` for SQL gen) | **~75%** (15/20) — the spec's strong/cheap cost-accuracy lever |
 | **Self-correction recovery** | up to **3/3** first-attempt errors rescued |
 | **LLM-judge faithfulness** | mean **~4.1/5**, validated at **Cohen's κ = 1.0** vs human labels (target ≥ 0.70) |
 | **PHI leakage** | **0**, enforced in code + CI |
-| **Cost / query** | **~$0.0004** · **p95 latency** ~6–10 s |
+| **Cost / query** | **~$0.0004** (cheap default) · **~$0.003** (routing on) · **p95 latency** ~6–10 s |
 
 **The PHI-safe story (the scarce signal):** a de-identified-views boundary, a
 least-privilege DB role that **physically cannot read base tables or the date-shift key**,
@@ -77,8 +78,13 @@ on synthetic data, all real code. See *Methodology & safety architecture* below.
   the requested rate unit, and `ILIKE` on description when a code is unknown.
   **Result-set accuracy ~40–50% (`m2-v1`) → ~60–65% (`m5-v1`)** — a **+15–20 point** gain
   at equal cost (~$0.0004/query), lower p95 latency (~15 s → ~6–10 s), recovery 3/3, and
-  PHI leakage still 0. Remaining misses (rate phrasing, per-patient subqueries, window
-  functions, exact code-based cohorts) are documented levers for model-routing / few-shot.
+  PHI leakage still 0. A **second lever — model routing** (`SQL_MODEL=gpt-4.1` for SQL
+  generation; plan/synthesize/judge stay on the cheap model) lifts accuracy to **~75%**
+  (rate phrasing, per-patient subqueries, polypharmacy now pass) at ~8× cost — a real
+  cost/accuracy tradeoff; the cheap model stays the default. The remaining **exact
+  SNOMED/LOINC code-cohort** misses (q008/q014 — e.g. Type 2 diabetes `44054006` is rank
+  63 of 283 condition codes, too rare to surface by frequency) need a **code-lookup
+  step**, documented as future work rather than overfitting the prompt to the eval.
 
 - **M6 — ship:** a minimal **demo UI** at `GET /` (question → `/ask`, renders answer, SQL,
   cost, audit id, trace link), a **CI quality + PHI gate** (`.github/workflows/eval.yml`:

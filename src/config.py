@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # ── LLM (via LiteLLM) ──────────────────────────────────────────────────────
     # `llm_model` is a LiteLLM model string, e.g. "gpt-4o-mini", "openai/gpt-4o".
     llm_model: str = Field(default="gpt-4o-mini", alias="LLM_MODEL")
+    # Optional stronger model for the hard step (SQL generation + self-correction). Empty
+    # = use llm_model everywhere. The cheap model still does plan / synthesize / judge —
+    # the spec's "one strong + one cheap" routing for a real cost/accuracy tradeoff.
+    sql_model: str = Field(default="", alias="SQL_MODEL")
     llm_temperature: float = Field(default=0.0, alias="LLM_TEMPERATURE")
     llm_max_tokens: int = Field(default=512, alias="LLM_MAX_TOKENS")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
@@ -85,6 +89,10 @@ class Settings(BaseSettings):
     def llm_ready(self) -> bool:
         # M0 wires OpenAI specifically; other providers added later as needed.
         return bool(self.openai_api_key)
+
+    @property
+    def sql_model_resolved(self) -> str:
+        return self.sql_model or self.llm_model
 
     @property
     def use_postgres(self) -> bool:

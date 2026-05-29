@@ -39,18 +39,20 @@ def _acc(state: AgentState, res: llm.LLMResult) -> dict:
     }
 
 
-def _run_llm(node: str, system: str, user: str) -> llm.LLMResult:
+def _run_llm(node: str, system: str, user: str, *, model: str | None = None) -> llm.LLMResult:
     """One model call, traced as a child generation of the request's trace.
 
-    Scans the FULL assembled prompt before sending — the no-PHI-to-model regime requires
-    every model input to pass the leakage scanner, not just the original question. A hit
-    raises LeakageError (a hard failure the caller degrades gracefully on)."""
+    `model` overrides the model for this node (SQL gen/self-correct route to the stronger
+    sql_model; plan/synthesize stay on the cheap llm_model). Scans the FULL assembled
+    prompt before sending — the no-PHI-to-model regime requires every model input to pass
+    the leakage scanner, not just the original question. A hit raises LeakageError (a hard
+    failure the caller degrades gracefully on)."""
+    mdl = model or settings.llm_model
     leakage.assert_clean(user, where=f"{node}:input")
-    with tracing.generation(
-        name=node, model=settings.llm_model, input=user, tags=["m2", node]
-    ) as box:
+    with tracing.generation(name=node, model=mdl, input=user, tags=["m2", node]) as box:
         res = llm.complete(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=mdl,
         )
         box["output"] = res.text
         box["usage_details"] = {
@@ -150,7 +152,10 @@ def generate_sql(state: AgentState) -> dict:
         f"Approach: {state.plan or '(none)'}\n\nWrite the SQL."
     )
     try:
-        res = _run_llm("generate_sql", prompts.SQL_GENERATE_PROMPT_V1, user)
+        res = _run_llm(
+            "generate_sql", prompts.SQL_GENERATE_PROMPT_V1, user,
+            model=settings.sql_model_resolved,
+        )
         sql = tools.extract_sql(res.text)
         return {**_sql_update(state, res, sql, "generate_sql")}
     except Exception as exc:  # noqa: BLE001
@@ -221,7 +226,10 @@ def self_correct(state: AgentState) -> dict:
         "Return the corrected SQL."
     )
     try:
-        res = _run_llm("self_correct", prompts.SELF_CORRECT_PROMPT_V1, user)
+        res = _run_llm(
+            "self_correct", prompts.SELF_CORRECT_PROMPT_V1, user,
+            model=settings.sql_model_resolved,
+        )
         sql = tools.extract_sql(res.text)
         return _sql_update(
             state, res, sql, f"self_correct #{state.retry_count + 1}",
