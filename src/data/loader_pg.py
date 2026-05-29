@@ -28,7 +28,29 @@ BASE_TABLES = (
     "medications", "observations", "immunizations", "payers",
 )
 
+# Cost/amount/count columns loaded as `double precision` so the views expose NUMERIC
+# values and the eval gold SQL's AVG/SUM and `payer_coverage = 0` comparisons work
+# without per-query casts. Everything else stays TEXT — codes (SNOMED/LOINC/RxNorm/CVX),
+# ids, and dates must never be numified (views.sql casts dates via ::timestamptz/::date).
+NUMERIC_COLUMNS: dict[str, frozenset[str]] = {
+    "patients": frozenset({"healthcare_expenses", "healthcare_coverage", "income"}),
+    "encounters": frozenset({"base_encounter_cost", "total_claim_cost", "payer_coverage"}),
+    "procedures": frozenset({"base_cost"}),
+    "medications": frozenset({"base_cost", "payer_coverage", "dispenses", "totalcost"}),
+    "immunizations": frozenset({"base_cost"}),
+    "payers": frozenset({
+        "amount_covered", "amount_uncovered", "revenue", "covered_encounters",
+        "uncovered_encounters", "covered_medications", "uncovered_medications",
+        "covered_procedures", "uncovered_procedures", "covered_immunizations",
+        "uncovered_immunizations", "unique_customers", "qols_avg", "member_months",
+    }),
+}
+
 csv.field_size_limit(2**31 - 1)
+
+
+def _col_type(table: str, column: str) -> str:
+    return "double precision" if column in NUMERIC_COLUMNS.get(table, frozenset()) else "TEXT"
 
 
 def _load_table(conn: psycopg.Connection, table: str, csv_path: Path) -> int:
@@ -36,7 +58,9 @@ def _load_table(conn: psycopg.Connection, table: str, csv_path: Path) -> int:
         reader = csv.reader(fh)
         header = [h.strip().lower() for h in next(reader)]
         ident = sql.Identifier
-        cols_sql = sql.SQL(", ").join(sql.SQL("{} TEXT").format(ident(c)) for c in header)
+        cols_sql = sql.SQL(", ").join(
+            sql.SQL("{} {}").format(ident(c), sql.SQL(_col_type(table, c))) for c in header
+        )
         copy_cols = sql.SQL(", ").join(ident(c) for c in header)
         with conn.cursor() as cur:
             # CASCADE drops dependent v_* views too — sidesteps the views.sql re-run trap.

@@ -137,10 +137,11 @@ def sql_execute(query: str, request_id: str | None = None) -> dict:
         db.assert_views_only(query)
         db.assert_aggregate_shape(query)
         result = pg.run_select(clean)
+        db.assert_safe_output_columns(result["columns"])  # post-exec: no row-level keys
     except db.UnsafeQueryError as exc:
-        outcome, error = "rejected", f"rejected: {exc}"
+        outcome, error, result = "rejected", f"rejected: {exc}", None  # discard any rows read
     except Exception as exc:  # noqa: BLE001 - DB/driver errors feed self-correction
-        outcome, error = "error", f"{type(exc).__name__}: {exc}"
+        outcome, error, result = "error", f"{type(exc).__name__}: {exc}", None
 
     audit_id = audit.record_access(
         request_id, query, tables, (result["row_count"] if result else None), outcome, error

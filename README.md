@@ -16,7 +16,7 @@ leakage scanner), a domain-aware **eval harness**, full **observability**
 
 ---
 
-## Status: Milestone M2 (PHI-safe layer) ✅
+## Status: Milestone M3 (eval harness) ✅
 
 - **M0 — skeleton:** repo scaffold (§7), pinned deps, Docker Compose (self-hosted
   Langfuse v3 stack + Postgres + app), Synthea→SQLite loader, FastAPI `/health` +
@@ -33,12 +33,25 @@ leakage scanner), a domain-aware **eval harness**, full **observability**
   role + a no-UPDATE/DELETE trigger; a **PHI-leakage scanner** on every model
   input/output; and the agent **switched off SQLite base tables onto the views**.
 
+  A post-M2 security review added a **semantic output-column guard** (rejects a raw
+  surrogate key like `patient` in results — `SELECT DISTINCT patient` would otherwise
+  return one row per individual), an **information_schema/pg_catalog block**, and a
+  **scan of every model input** (not just the question).
+- **M3 — eval harness:** `python eval/run_eval.py` runs the agent over the 20 labeled
+  cases (the agent never sees `gold_sql`), scores **result-set match** (order- and
+  precision-normalized) vs the executed gold SQL, and writes a timestamped report with
+  accuracy by difficulty/tag, recovery rate, p50/p95 latency, cost/query, and PHI
+  leakage. **Baseline: ~50% result-set accuracy, 0 PHI leakage** (gpt-4o-mini). The
+  misses cluster into clear optimization levers for M5 (code-vs-description grouping,
+  ICD-10-vs-SNOMED code grounding, rate/join phrasing).
+
 The PHI controls are layered defense-in-depth — the **DB grant is the primary control**
 (the agent's role physically cannot read a base table), with code-level guards
-(`assert_views_only`, `assert_aggregate_shape`) as a fast, structured second line.
+(`assert_views_only`, `assert_aggregate_shape`, `assert_safe_output_columns`) as a fast,
+structured second line.
 
-Not yet built (deliberately): the eval harness (M3), judge validation (M4), optimization
-(M5), CI gate + deploy (M6). Those modules exist as honest placeholders.
+Not yet built (deliberately): judge validation (M4), optimization (M5), CI gate + deploy
+(M6). Those modules exist as honest placeholders.
 
 ### Verified end-to-end (M2)
 

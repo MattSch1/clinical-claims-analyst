@@ -70,12 +70,28 @@ _AGG_OR_GROUP_RE = re.compile(
     r"\b(count|sum|avg|min|max)\s*\(|\bgroup\s+by\b|\bdistinct\b", re.IGNORECASE
 )
 _SELECT_STAR_RE = re.compile(r"select\s+\*", re.IGNORECASE)
+# Postgres exposes information_schema / pg_catalog to PUBLIC; an agent query must never
+# enumerate them (it could confirm a base-table 'ssn' column exists). The trusted
+# schema_inspect metadata calls in src/data/pg.py do NOT go through this guard.
+_METADATA_RE = re.compile(
+    r"\b(information_schema|pg_catalog|pg_class|pg_attribute|pg_namespace|pg_tables|"
+    r"pg_roles|pg_authid|pg_shadow|pg_stat\w*)\b",
+    re.IGNORECASE,
+)
+# Surrogate per-individual keys: a result that exposes one of these as an OUTPUT column
+# is a row-level individual record set (one row per patient/encounter), which the
+# no-PHI-to-model regime forbids — even though DISTINCT/GROUP BY makes it "aggregate-shaped".
+SURROGATE_OUTPUT_KEYS = frozenset({"patient", "encounter", "id"})
 
 
 def assert_views_only(sql: str) -> str:
     """Reject any reference to a base table or patient_date_offset (the v_* views use
     an underscore prefix, so \\bencounters\\b never matches inside v_encounters)."""
     cleaned = _COMMENT_RE.sub(" ", sql)
+    if _METADATA_RE.search(cleaned):
+        raise UnsafeQueryError(
+            "system catalog / information_schema access is not allowed; query the v_* views"
+        )
     for rel in FORBIDDEN_RELATIONS:
         if re.search(rf"\b{re.escape(rel)}\b", cleaned, re.IGNORECASE):
             raise UnsafeQueryError(
@@ -98,6 +114,22 @@ def assert_aggregate_shape(sql: str) -> str:
             "DISTINCT); row-level result sets are restricted"
         )
     return sql
+
+
+def assert_safe_output_columns(columns: list[str]) -> None:
+    """Semantic no-row-level-records check (run on the *result* columns, post-execution).
+
+    DISTINCT/GROUP BY on a surrogate key (e.g. `SELECT DISTINCT patient FROM v_encounters`)
+    passes assert_aggregate_shape syntactically but returns one row per individual. Reject
+    any result that exposes a raw surrogate key as an output column — population analytics
+    never needs a per-record key in its output.
+    """
+    bad = sorted({c for c in columns if c.lower() in SURROGATE_OUTPUT_KEYS})
+    if bad:
+        raise UnsafeQueryError(
+            f"result exposes row-level surrogate key column(s) {bad}; return population "
+            "aggregates, not per-record keys"
+        )
 
 
 def _connect_ro(path: str | None = None) -> sqlite3.Connection:

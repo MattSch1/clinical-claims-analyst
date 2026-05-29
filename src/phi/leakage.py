@@ -47,9 +47,23 @@ class LeakageError(RuntimeError):
         super().__init__(f"PHI leakage detected ({len(leaks)} hit(s)): {preview}")
 
 
+# The leakage GATE uses only HIGH-PRECISION identifier patterns. `long_id` (9+ digit
+# runs) and `url` are deliberately EXCLUDED: de-identified clinical data is full of long
+# numeric CODES (SNOMED/LOINC/RxNorm) that are NOT identifiers, so gating on them would
+# false-positive constantly (e.g. SNOMED 314529007). scrub() still redacts them as a
+# non-fatal belt-and-braces measure.
+_GATE_KINDS: tuple[str, ...] = ("ssn", "email", "phone", "ip")
+
+
 def scan_text(text: str, *, where: str = "text") -> list[Leak]:
-    """Identifier-pattern scan for model input/output."""
-    return [Leak(kind=kind, match=m, where=where) for kind, m in scrub.find(text)]
+    """High-precision identifier-pattern scan for model input/output (the hard gate)."""
+    if not text:
+        return []
+    leaks: list[Leak] = []
+    for kind in _GATE_KINDS:
+        pattern = scrub.PII_PATTERNS[kind]
+        leaks.extend(Leak(kind=kind, match=m.group(0), where=where) for m in pattern.finditer(text))
+    return leaks
 
 
 def scan_sql(sql: str) -> list[Leak]:

@@ -40,9 +40,14 @@ def _acc(state: AgentState, res: llm.LLMResult) -> dict:
 
 
 def _run_llm(node: str, system: str, user: str) -> llm.LLMResult:
-    """One model call, traced as a child generation of the request's trace."""
+    """One model call, traced as a child generation of the request's trace.
+
+    Scans the FULL assembled prompt before sending — the no-PHI-to-model regime requires
+    every model input to pass the leakage scanner, not just the original question. A hit
+    raises LeakageError (a hard failure the caller degrades gracefully on)."""
+    leakage.assert_clean(user, where=f"{node}:input")
     with tracing.generation(
-        name=node, model=settings.llm_model, input=user, tags=["m1", node]
+        name=node, model=settings.llm_model, input=user, tags=["m2", node]
     ) as box:
         res = llm.complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -206,10 +211,13 @@ def validate(state: AgentState) -> dict:
 
 def self_correct(state: AgentState) -> dict:
     schema = state.schema_snapshot or tools.schema_inspect()
+    # Scrub the DB error before it enters a prompt — it's the one prompt input not
+    # produced by the de-identified views and could echo a literal from the query.
+    db_error = scrub.scrub(state.execution_error or "query returned no rows")
     user = (
         f"Schema:\n{schema}\n\nQuestion: {state.question}\n\n"
         f"Failed SQL:\n{state.candidate_sql or '(none)'}\n\n"
-        f"Database error / problem: {state.execution_error or 'query returned no rows'}\n\n"
+        f"Database error / problem: {db_error}\n\n"
         "Return the corrected SQL."
     )
     try:
@@ -237,27 +245,31 @@ def synthesize(state: AgentState) -> dict:
         try:
             res = _run_llm("synthesize", prompts.SYNTHESIZE_PROMPT_V1, user)
             answer = res.text.strip()
-            status = state.status if state.status in ("ok", "recovered") else "ok"
-            # Output leakage gate: an identifier slipping into the answer is a hard fail.
-            # On synthetic aggregate data this never fires; if it does, scrub + record.
+            # Output leakage gate: an identifier in the answer is a HARD failure (not a
+            # silent redaction) — refuse the answer. On synthetic aggregates it never fires.
             out_leaks = leakage.scan_text(answer, where="synthesize:output")
-            extra: dict = {}
             if out_leaks:
-                answer = scrub.scrub(answer)
-                extra["leakage_hits"] = state.leakage_hits + [
-                    f"output:{lk.kind}" for lk in out_leaks
-                ]
+                return {
+                    "final_answer": "Answer withheld: a PHI-safety (leakage) check failed.",
+                    "status": "refused",
+                    "leakage_hits": state.leakage_hits + [f"output:{lk.kind}" for lk in out_leaks],
+                    "step_trace": state.step_trace + ["synthesize: OUTPUT leakage -> refused"],
+                    **_acc(state, res),
+                }
+            status = state.status if state.status in ("ok", "recovered") else "ok"
             return {
                 "final_answer": answer,
                 "status": status,
                 "step_trace": state.step_trace + ["synthesize: answered"],
-                **extra,
                 **_acc(state, res),
             }
         except Exception as exc:  # noqa: BLE001
             logger.warning("synthesize node failed; using templated answer", exc_info=True)
+            fb = _fallback_answer(state)
+            if leakage.scan_text(fb):  # gate the templated fallback too
+                fb = "Answer withheld: a PHI-safety check failed on the result."
             return {
-                "final_answer": _fallback_answer(state),
+                "final_answer": fb,
                 "status": "ok",
                 "step_trace": state.step_trace + [f"synthesize failed, templated: {exc}"],
             }

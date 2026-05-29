@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import pytest
 
-from src.data.db import UnsafeQueryError, assert_aggregate_shape, assert_views_only
+from src.data.db import (
+    UnsafeQueryError,
+    assert_aggregate_shape,
+    assert_safe_output_columns,
+    assert_views_only,
+)
 from src.phi import audit, leakage
 
 
@@ -48,6 +53,36 @@ def test_aggregate_shape_accepts_aggregates():
     assert assert_aggregate_shape("SELECT count(*) AS n FROM v_patients")
     assert assert_aggregate_shape("SELECT gender, count(*) FROM v_patients GROUP BY gender")
     assert assert_aggregate_shape("SELECT DISTINCT race FROM v_patients")
+
+
+# ── semantic output-column guard (the surrogate-key row-level leak) ─────────────
+def test_output_columns_reject_surrogate_keys():
+    # `SELECT DISTINCT patient ...` is syntactically aggregate-shaped (the gap) ...
+    assert assert_aggregate_shape("SELECT DISTINCT patient FROM v_encounters")
+    # ... but the post-execution output-column check rejects the per-individual key.
+    for cols in (["patient"], ["encounter", "n"], ["id"]):
+        with pytest.raises(UnsafeQueryError):
+            assert_safe_output_columns(cols)
+
+
+def test_output_columns_allow_aggregates_and_categoricals():
+    assert_safe_output_columns(["encounterclass", "n"])
+    assert_safe_output_columns(["name", "covered"])
+    assert_safe_output_columns(["avg_cost"])
+
+
+# ── system-catalog enumeration is blocked on the agent path ─────────────────────
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "SELECT DISTINCT table_name FROM information_schema.columns",
+        "SELECT relname FROM pg_catalog.pg_class",
+        "SELECT count(*) FROM pg_tables",
+    ],
+)
+def test_views_only_blocks_system_catalogs(bad):
+    with pytest.raises(UnsafeQueryError):
+        assert_views_only(bad)
 
 
 # ── leakage gate ────────────────────────────────────────────────────────────────

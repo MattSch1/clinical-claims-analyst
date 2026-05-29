@@ -56,6 +56,10 @@ def _apply_grants(cur: psycopg.Cursor, db_name: str) -> None:
     cur.execute(sql.SQL("REVOKE ALL ON {} FROM {}").format(forbidden, ro))
     cur.execute(sql.SQL("ALTER ROLE {} SET statement_timeout = '10s'").format(ro))
     cur.execute(sql.SQL("ALTER ROLE {} SET default_transaction_read_only = on").format(ro))
+    # Lock the fail-closed posture: any table the owner creates LATER is not auto-granted.
+    cur.execute(
+        sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM {}").format(ro)
+    )
 
 
 def _apply_views(dsn: str) -> None:
