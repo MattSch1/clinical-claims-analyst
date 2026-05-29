@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import asynccontextmanager
+from uuid import uuid4
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -63,6 +64,8 @@ class AskResponse(BaseModel):
     cost_usd: float = 0.0
     model: str
     trace_url: str | None = None
+    audit_id: int | None = None      # access_audit row id (the audit trail in action)
+    leakage_count: int = 0           # PHI-leakage findings on model I/O (target: 0)
     note: str | None = None
 
 
@@ -72,9 +75,11 @@ def health() -> dict:
         "status": "ok",
         "service": settings.app_name,
         "version": "0.2.0",
-        "milestone": "M1",
+        "milestone": "M2",
+        "data_backend": settings.data_backend,
         "llm_configured": settings.llm_ready,
         "langfuse_configured": settings.langfuse_ready,
+        "postgres_configured": settings.pg_ready,
     }
 
 
@@ -89,6 +94,7 @@ def ask(req: AskRequest) -> AskResponse:
         )
 
     t0 = time.perf_counter()
+    request_id = uuid4().hex
     state = None
     trace_link = None
     try:
@@ -97,10 +103,10 @@ def ask(req: AskRequest) -> AskResponse:
             name="ask",
             input=req.question,
             trace_name="ask",
-            tags=["m1", "ask", "agent"],
-            metadata={"milestone": "M1"},
+            tags=["m2", "ask", "agent"],
+            metadata={"milestone": "M2", "request_id": request_id},
         ) as root:
-            state = run_agent(req.question)
+            state = run_agent(req.question, request_id=request_id)
             root["output"] = state.final_answer
         trace_link = tracing.trace_url(root.get("trace_id"))
     except Exception as exc:  # never 500 — graceful degradation (hard rule)
@@ -126,5 +132,7 @@ def ask(req: AskRequest) -> AskResponse:
         cost_usd=round(state.total_cost_usd, 6),
         model=settings.llm_model,
         trace_url=trace_link,
+        audit_id=state.audit_id,
+        leakage_count=len(state.leakage_hits),
         note=note,
     )

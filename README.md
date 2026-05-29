@@ -16,26 +16,40 @@ leakage scanner), a domain-aware **eval harness**, full **observability**
 
 ---
 
-## Status: Milestone M0 (skeleton) ✅
+## Status: Milestone M2 (PHI-safe layer) ✅
 
-What's wired right now:
+- **M0 — skeleton:** repo scaffold (§7), pinned deps, Docker Compose (self-hosted
+  Langfuse v3 stack + Postgres + app), Synthea→SQLite loader, FastAPI `/health` +
+  `/ask`, LiteLLM→one model, Langfuse tracing (verified via the API).
+- **M1 — agent loop:** LangGraph graph with six nodes (plan → generate_sql →
+  execute_sql → validate → self_correct → synthesize), read-only SELECT-only guard,
+  schema introspection with categorical-value grounding, self-correction cap 3 +
+  graceful degradation, one nested Langfuse trace per request.
+- **M2 — PHI-safe layer:** Synthea loaded into **Postgres**; the de-identified
+  **`v_*` views** (`src/data/views.sql`, per-patient date-shift, age-banding, ZIP
+  truncation) applied via an idempotent bootstrap; a **least-privilege `analyst_ro`
+  role** that can `SELECT` the views *only* (never base tables or `patient_date_offset`);
+  an **append-only access audit** written by a separate INSERT-only `audit_writer`
+  role + a no-UPDATE/DELETE trigger; a **PHI-leakage scanner** on every model
+  input/output; and the agent **switched off SQLite base tables onto the views**.
 
-- **Repo scaffold** per spec §7, dependencies pinned in `pyproject.toml`.
-- **Docker Compose** stack: self-hosted **Langfuse** server (the v3.x platform:
-  web · worker · postgres · clickhouse · redis · minio) + an **analytics Postgres**
-  (for M2) + the **app**. *(The Langfuse **server** is on the 3.x line; the Langfuse
-  **Python SDK** is independently on the 4.x line — two separate version lines that
-  work together, verified here end-to-end.)*
-- **Synthea → SQLite loader** (`src/data/load.py`) for a tiny (~200 patient)
-  population. *(Postgres + de-identified views come in M2.)*
-- **FastAPI**: `GET /health` and a stub `POST /ask`.
-- **LiteLLM** wired to one model (OpenAI via `OPENAI_API_KEY`).
-- **Langfuse tracing**: every model call is recorded as a trace, confirmed by a
-  smoke test that queries the Langfuse API.
+The PHI controls are layered defense-in-depth — the **DB grant is the primary control**
+(the agent's role physically cannot read a base table), with code-level guards
+(`assert_views_only`, `assert_aggregate_shape`) as a fast, structured second line.
 
-Not yet built (later milestones, deliberately): the LangGraph agent loop (M1),
-the PHI layer + Postgres views (M2), the eval harness (M3+). Those modules exist
-as honest placeholders noting their milestone.
+Not yet built (deliberately): the eval harness (M3), judge validation (M4), optimization
+(M5), CI gate + deploy (M6). Those modules exist as honest placeholders.
+
+### Verified end-to-end (M2)
+
+- `analyst_ro` → `SELECT FROM v_patients` ✅; `FROM patients` / `FROM patient_date_offset`
+  → **permission denied** (DB-level).
+- The agent answers 10/10 demo questions querying **only `v_*` views**; every execution
+  writes one **audit row** (ok / rejected / error); an `UPDATE` on the audit table is
+  blocked by the trigger.
+- A bare `SELECT *` is **refused** (and audited as `rejected`).
+- A question containing an SSN is **refused before the model** (`status=refused`); the
+  leakage scanner reports **0** hits on aggregate output.
 
 ### A note on the Langfuse↔LiteLLM integration
 
@@ -104,14 +118,28 @@ python scripts/smoke_trace.py
 # -> prints the model reply, the trace_url, and "CONFIRMED: trace present in Langfuse"
 ```
 
+### 4b. (M2) Bring up Postgres + the de-identified views
+
+```bash
+docker compose up -d analytics-postgres
+# In .env set DATA_BACKEND=postgres and the three DSNs + role passwords (see .env.example).
+python -m src.data.bootstrap_pg   # loads base tables, applies views.sql, creates
+                                  # analyst_ro (views-only) + audit_writer (INSERT-only)
+```
+
+This is idempotent (re-runnable). After it, the agent queries the de-identified `v_*`
+views via the least-privilege role; every execution is audited; `SELECT *` and any
+base-table reference are refused.
+
 ### 5. Run the API
 
 ```bash
 uvicorn src.api.main:app --reload
-curl localhost:8000/health
+curl localhost:8000/health     # shows milestone, data_backend, postgres_configured
 curl -s localhost:8000/ask -H 'content-type: application/json' \
-     -d '{"question":"What is this service?"}' | python -m json.tool
-# the response includes a trace_url you can open in the Langfuse UI
+     -d '{"question":"Average total claim cost per encounter by class?"}' | python -m json.tool
+# the response includes sql, row_count, cost_usd, trace_url, and audit_id
+python scripts/m1_demo.py       # 10-question demo over the de-identified views
 ```
 
 ### Run everything in containers instead

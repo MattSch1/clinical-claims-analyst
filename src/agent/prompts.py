@@ -1,44 +1,48 @@
 """Version-tagged prompt constants so eval reports stay comparable across changes
 (spec hard rule). Bump the version suffix + PROMPT_VERSION when a prompt changes.
 
-M1 targets the SQLite base tables (SQLite dialect, columns stored as TEXT). M2 will
-retarget these at the de-identified Postgres views.
+M2 targets PostgreSQL and the de-identified v_* VIEWS (the only thing the agent's
+read-only role can reach). The SQLite backend is now test-only.
 """
 
 from __future__ import annotations
 
-PROMPT_VERSION = "m1-v1"
+PROMPT_VERSION = "m2-v1"
 
 # Shared dialect/safety rules injected into the SQL prompts.
 _SQL_RULES = """\
 Rules for the SQL you write:
-- SQLite dialect. Exactly ONE statement, a SELECT (or WITH ... SELECT). Never
-  INSERT/UPDATE/DELETE/DDL/PRAGMA, no semicolons, no comments.
-- Be AGGREGATE-oriented: return counts, rates, sums, averages, or distributions —
-  not raw individual patient rows.
-- Every column is stored as TEXT. CAST numeric columns for math, e.g.
-  AVG(CAST(total_claim_cost AS REAL)). Dates are ISO strings ('YYYY-MM-DD...'):
-  use substr(col,1,4) for the year or date(col) for date math.
+- PostgreSQL dialect. Exactly ONE statement, a SELECT (or WITH ... SELECT). Never
+  INSERT/UPDATE/DELETE/DDL, no semicolons, no comments.
+- Query ONLY these de-identified views: v_patients, v_encounters, v_conditions,
+  v_procedures, v_medications, v_observations, v_immunizations, v_payers. NEVER
+  reference base tables.
+- Be AGGREGATE-oriented: counts, rates, sums, averages, distributions — never raw
+  individual patient rows, and NEVER SELECT *.
+- Cast for math with Postgres syntax, e.g. ROUND(AVG(total_claim_cost::numeric), 2).
+  Prefer the views' pre-transformed columns where they exist (age, age_band,
+  encounter_year, start_year, onset_year, los_days, zip3) over raw dates.
 - Alias output columns with clear names; round money/rates to 2-4 decimals.
-- Use only tables and columns that appear in the provided schema."""
+- Use only views and columns that appear in the provided schema."""
 
 PLAN_PROMPT_V1 = """\
 You are a careful clinical and claims data analyst. Given a question and the available
-schema, outline (2-4 sentences) how to answer it: which table(s) and column(s), the
-aggregation, and any joins/filters. Do NOT write SQL yet. If the question would require
-returning individual patient records, plan an aggregate version instead (this system
-only returns population-level analytics)."""
+de-identified view schema, outline (2-4 sentences) how to answer it: which view(s) and
+column(s), the aggregation, and any joins/filters. Do NOT write SQL yet. If the question
+would require returning individual patient records, plan an aggregate version instead
+(this system only returns population-level analytics over de-identified views)."""
 
 SQL_GENERATE_PROMPT_V1 = f"""\
-You translate an analytics question into a single read-only SQLite query.
+You translate an analytics question into a single read-only PostgreSQL query over the
+de-identified views.
 
 {_SQL_RULES}
 
 Return ONLY the SQL query — no prose, no explanation, no markdown fences."""
 
 SELF_CORRECT_PROMPT_V1 = f"""\
-Your previous SQLite query failed or returned nothing. Using the schema, the question,
-the failed SQL, and the database error, write a corrected query.
+Your previous PostgreSQL query failed or returned nothing. Using the view schema, the
+question, the failed SQL, and the database error, write a corrected query.
 
 {_SQL_RULES}
 

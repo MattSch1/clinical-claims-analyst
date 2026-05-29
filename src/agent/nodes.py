@@ -17,6 +17,7 @@ from src.agent.state import AgentState
 from src.config import get_settings
 from src.llm import client as llm
 from src.obs import tracing
+from src.phi import leakage, scrub
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -79,6 +80,31 @@ def _has_data(result: dict | None) -> bool:
     return True
 
 
+def _sql_update(
+    state: AgentState, res: llm.LLMResult, sql: str, node: str, *, extra: dict | None = None
+) -> dict:
+    """Build a candidate-SQL state update, scanning the SQL for identifier columns
+    (defense-in-depth; the views-only role already can't reach them). On a hit, set an
+    execution_error so validate routes to self-correction instead of executing it."""
+    leaks = leakage.scan_sql(sql)
+    out: dict = {
+        "candidate_sql": sql,
+        "sql_attempts": state.sql_attempts + [sql],
+        **_acc(state, res),
+    }
+    if leaks:
+        cols = ", ".join(sorted({lk.match for lk in leaks}))
+        out["execution_error"] = f"query references restricted identifier column(s): {cols}"
+        out["leakage_hits"] = state.leakage_hits + [f"sql:{lk.match}" for lk in leaks]
+        out["step_trace"] = state.step_trace + [f"{node}: LEAKAGE blocked id column(s) {cols}"]
+    else:
+        out["execution_error"] = None
+        out["step_trace"] = state.step_trace + [f"{node}: {_clip(sql)}"]
+    if extra:
+        out.update(extra)
+    return out
+
+
 def _fallback_answer(state: AgentState) -> str:
     res = state.execution_result or {}
     cols = res.get("columns", [])
@@ -121,13 +147,7 @@ def generate_sql(state: AgentState) -> dict:
     try:
         res = _run_llm("generate_sql", prompts.SQL_GENERATE_PROMPT_V1, user)
         sql = tools.extract_sql(res.text)
-        return {
-            "candidate_sql": sql,
-            "sql_attempts": state.sql_attempts + [sql],
-            "execution_error": None,
-            "step_trace": state.step_trace + [f"generate_sql: {_clip(sql)}"],
-            **_acc(state, res),
-        }
+        return {**_sql_update(state, res, sql, "generate_sql")}
     except Exception as exc:  # noqa: BLE001
         logger.warning("generate_sql node failed", exc_info=True)
         return {
@@ -146,19 +166,24 @@ def execute_sql(state: AgentState) -> dict:
             "step_trace": state.step_trace + ["execute_sql: skipped (no SQL)"],
         }
     with tracing.tool(name="sql_execute", input=sql) as box:
-        result = tools.sql_execute(sql)  # guarded, read-only; never raises
+        # guarded, read-only, audited (one audit row per outcome); never raises
+        result = tools.sql_execute(sql, request_id=state.request_id)
+        audit_id = result.get("audit_id")
         if "error" in result:
-            box["output"] = {"error": result["error"]}
+            box["output"] = {"error": result["error"], "audit_id": audit_id}
             return {
                 "execution_result": None,
                 "execution_error": result["error"],
+                "audit_id": audit_id,
                 "step_trace": state.step_trace + [f"execute_sql error: {_clip(result['error'])}"],
             }
         box["output"] = {"row_count": result["row_count"], "columns": result["columns"]}
+        ok_note = f"execute_sql: {result['row_count']} rows (audit {audit_id})"
         return {
             "execution_result": result,
             "execution_error": None,
-            "step_trace": state.step_trace + [f"execute_sql: {result['row_count']} rows"],
+            "audit_id": audit_id,
+            "step_trace": state.step_trace + [ok_note],
         }
 
 
@@ -190,15 +215,10 @@ def self_correct(state: AgentState) -> dict:
     try:
         res = _run_llm("self_correct", prompts.SELF_CORRECT_PROMPT_V1, user)
         sql = tools.extract_sql(res.text)
-        note = f"self_correct #{state.retry_count + 1}: {_clip(sql)}"
-        return {
-            "candidate_sql": sql,
-            "sql_attempts": state.sql_attempts + [sql],
-            "retry_count": state.retry_count + 1,
-            "execution_error": None,
-            "step_trace": state.step_trace + [note],
-            **_acc(state, res),
-        }
+        return _sql_update(
+            state, res, sql, f"self_correct #{state.retry_count + 1}",
+            extra={"retry_count": state.retry_count + 1},
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("self_correct node failed", exc_info=True)
         return {
@@ -216,11 +236,22 @@ def synthesize(state: AgentState) -> dict:
         )
         try:
             res = _run_llm("synthesize", prompts.SYNTHESIZE_PROMPT_V1, user)
+            answer = res.text.strip()
             status = state.status if state.status in ("ok", "recovered") else "ok"
+            # Output leakage gate: an identifier slipping into the answer is a hard fail.
+            # On synthetic aggregate data this never fires; if it does, scrub + record.
+            out_leaks = leakage.scan_text(answer, where="synthesize:output")
+            extra: dict = {}
+            if out_leaks:
+                answer = scrub.scrub(answer)
+                extra["leakage_hits"] = state.leakage_hits + [
+                    f"output:{lk.kind}" for lk in out_leaks
+                ]
             return {
-                "final_answer": res.text.strip(),
+                "final_answer": answer,
                 "status": status,
                 "step_trace": state.step_trace + ["synthesize: answered"],
+                **extra,
                 **_acc(state, res),
             }
         except Exception as exc:  # noqa: BLE001

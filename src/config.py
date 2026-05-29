@@ -51,8 +51,23 @@ class Settings(BaseSettings):
         default="clinical-claims-analyst", alias="LANGFUSE_PROJECT_ID"
     )
 
-    # ── Data (M0: SQLite; Postgres + de-identified views arrive in M2) ─────────
+    # ── Data backend ────────────────────────────────────────────────────────
+    # "sqlite" = the M1 base-table copy (the test/CI default — hermetic).
+    # "postgres" = the M2 de-identified views via the least-privilege role.
+    data_backend: str = Field(default="sqlite", alias="DATA_BACKEND")
     sqlite_path: str = Field(default="data/synthea.db", alias="SQLITE_PATH")
+
+    # Three separate Postgres roles/DSNs (read from env; never hardcoded):
+    #   owner  — loads base tables, applies views.sql, owns the audit table.
+    #   analyst_ro — the agent's ONLY read path: SELECT on the v_* views only.
+    #   audit_writer — INSERT-only on the append-only access_audit table.
+    analytics_owner_dsn: str | None = Field(default=None, alias="ANALYTICS_OWNER_DSN")
+    analyst_ro_dsn: str | None = Field(default=None, alias="ANALYST_RO_DSN")
+    audit_writer_dsn: str | None = Field(default=None, alias="AUDIT_WRITER_DSN")
+    # Passwords for the roles the bootstrap creates (separate from the DSNs so the
+    # bootstrap can CREATE ROLE; the DSNs embed them for runtime connections).
+    analyst_ro_password: str | None = Field(default=None, alias="ANALYST_RO_PASSWORD")
+    audit_writer_password: str | None = Field(default=None, alias="AUDIT_WRITER_PASSWORD")
 
     @property
     def langfuse_browser_url(self) -> str:
@@ -70,6 +85,15 @@ class Settings(BaseSettings):
     def llm_ready(self) -> bool:
         # M0 wires OpenAI specifically; other providers added later as needed.
         return bool(self.openai_api_key)
+
+    @property
+    def use_postgres(self) -> bool:
+        return self.data_backend.lower() == "postgres"
+
+    @property
+    def pg_ready(self) -> bool:
+        """The agent can use the Postgres views path."""
+        return self.use_postgres and bool(self.analyst_ro_dsn)
 
 
 @lru_cache

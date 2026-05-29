@@ -24,6 +24,9 @@ dependencies = [
     "httpx==0.28.1",
     "litellm==1.86.2",
     "langfuse==4.7.0",
+    # Postgres driver (M2). Pure-Python; the [binary] extra ships precompiled libpq
+    # (no system libpq/pg_config); zero pydantic dependency. Not psycopg2.
+    "psycopg[binary]==3.3.4",
     # Agent orchestration — pinned now (declared dependency), first used in M1.
     # langchain-core is pinned to the floor langgraph 1.2.2 requires; let pip
     # resolve langgraph-checkpoint / langgraph-prebuilt from langgraph's own pins.
@@ -54,6 +57,9 @@ select = ["E", "F", "W", "I", "UP", "B", "S"]
 "tests/**" = ["S101"]          # asserts are the point of tests
 "src/data/load.py" = ["S608"]  # CREATE TABLE built from CSV headers (synthetic, trusted)
 "src/data/db.py" = ["S608"]    # PRAGMA built from trusted sqlite_master table names
+"src/data/loader_pg.py" = ["S608"]    # CREATE/COPY targets from a trusted table allow-list
+"src/data/bootstrap_pg.py" = ["S608"] # DDL composed from trusted constants
+"src/data/pg.py" = ["S608"]           # view/column validated against the allow-list first
 "scripts/**" = ["S101"]
 # Starter file (provided; wired at M2) — its str+Enum is intentional, leave as-is.
 "src/phi/classification.py" = ["UP042"]

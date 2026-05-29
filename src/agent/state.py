@@ -9,6 +9,7 @@ shape does not change.
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -16,6 +17,7 @@ from pydantic import BaseModel, Field
 class AgentState(BaseModel):
     # Inputs
     question: str
+    request_id: str = Field(default_factory=lambda: uuid4().hex)  # attributes the audit row
 
     # Working memory
     schema_snapshot: str | None = None          # rendered view/table schema shown to the model
@@ -27,9 +29,13 @@ class AgentState(BaseModel):
     retry_count: int = 0                         # self-correction attempts (cap = MAX_RETRIES)
     route: str | None = None                     # validate node's branch decision
 
+    # PHI controls (M2)
+    audit_id: int | None = None                  # access_audit row id for this execution
+    leakage_hits: list[str] = Field(default_factory=list)  # any model-I/O leakage findings
+
     # Outputs
     final_answer: str | None = None
-    status: str = "pending"                      # ok | recovered | empty | failed
+    status: str = "pending"                      # ok | recovered | empty | failed | refused
 
     # Bookkeeping (cost/latency observability)
     total_cost_usd: float = 0.0

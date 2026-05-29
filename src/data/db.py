@@ -50,6 +50,56 @@ def assert_select_only(sql: str) -> str:
     return stripped
 
 
+# ── M2 views-only + aggregate-shape guards (defense-in-depth on the Postgres path) ──
+# The PRIMARY control is the DB grant (analyst_ro can only SELECT the v_* views). These
+# code guards give a fast, structured rejection before a round-trip and hold if the DB
+# layer were ever misconfigured. assert_select_only above is left byte-for-byte intact.
+VIEW_ALLOWLIST = frozenset({
+    "v_patients", "v_encounters", "v_conditions", "v_procedures",
+    "v_medications", "v_observations", "v_immunizations", "v_payers",
+})
+# Base tables + the per-patient offset table (reading offset_days would let an attacker
+# reverse the date-shift and recover absolute service dates — the key re-id vector).
+FORBIDDEN_RELATIONS = frozenset({
+    "patients", "encounters", "conditions", "procedures", "medications",
+    "observations", "immunizations", "payers", "careplans", "claims",
+    "claims_transactions", "payer_transitions", "organizations", "providers",
+    "allergies", "devices", "imaging_studies", "supplies", "patient_date_offset",
+})
+_AGG_OR_GROUP_RE = re.compile(
+    r"\b(count|sum|avg|min|max)\s*\(|\bgroup\s+by\b|\bdistinct\b", re.IGNORECASE
+)
+_SELECT_STAR_RE = re.compile(r"select\s+\*", re.IGNORECASE)
+
+
+def assert_views_only(sql: str) -> str:
+    """Reject any reference to a base table or patient_date_offset (the v_* views use
+    an underscore prefix, so \\bencounters\\b never matches inside v_encounters)."""
+    cleaned = _COMMENT_RE.sub(" ", sql)
+    for rel in FORBIDDEN_RELATIONS:
+        if re.search(rf"\b{re.escape(rel)}\b", cleaned, re.IGNORECASE):
+            raise UnsafeQueryError(
+                f"query references non-view relation '{rel}'; only the de-identified "
+                "v_* views may be queried"
+            )
+    return sql
+
+
+def assert_aggregate_shape(sql: str) -> str:
+    """Refuse row-level queries (no-PHI-to-model regime, spec §5.3): reject bare
+    SELECT * and any query lacking an aggregate / GROUP BY / DISTINCT. Tuned to accept
+    aggregate-OR-GROUP-BY-OR-DISTINCT so legitimate analytic queries aren't rejected."""
+    cleaned = _COMMENT_RE.sub(" ", sql)
+    if _SELECT_STAR_RE.search(cleaned):
+        raise UnsafeQueryError("row-level 'SELECT *' is not allowed; use an aggregate query")
+    if not _AGG_OR_GROUP_RE.search(cleaned):
+        raise UnsafeQueryError(
+            "query is not aggregate-shaped (needs COUNT/SUM/AVG/MIN/MAX, GROUP BY, or "
+            "DISTINCT); row-level result sets are restricted"
+        )
+    return sql
+
+
 def _connect_ro(path: str | None = None) -> sqlite3.Connection:
     """Open the SQLite DB in read-only mode (writes fail at the driver level)."""
     db_path = Path(path or get_settings().sqlite_path)
