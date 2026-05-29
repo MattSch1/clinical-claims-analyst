@@ -26,9 +26,17 @@ services:
       # condition. Tracing degrades gracefully if Langfuse isn't ready yet.
       langfuse-web:
         condition: service_started
+      analytics-postgres:
+        condition: service_healthy
     environment:
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # M2+ agent runs on the de-identified views. Run `python -m src.data.bootstrap_pg`
+      # once first; these DSNs use the IN-NETWORK host (analytics-postgres:5432).
+      DATA_BACKEND: ${DATA_BACKEND:-postgres}
+      ANALYTICS_OWNER_DSN: postgresql://${ANALYTICS_POSTGRES_USER:-analytics}:${ANALYTICS_POSTGRES_PASSWORD:-analytics}@analytics-postgres:5432/${ANALYTICS_POSTGRES_DB:-analytics}
+      ANALYST_RO_DSN: postgresql://analyst_ro:${ANALYST_RO_PASSWORD:-analyst_ro}@analytics-postgres:5432/${ANALYTICS_POSTGRES_DB:-analytics}
+      AUDIT_WRITER_DSN: postgresql://audit_writer:${AUDIT_WRITER_PASSWORD:-audit_writer}@analytics-postgres:5432/${ANALYTICS_POSTGRES_DB:-analytics}
       LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-true}
       # In-network ingest host (NOT localhost — that would be the app container).
       LANGFUSE_HOST: http://langfuse-web:3000

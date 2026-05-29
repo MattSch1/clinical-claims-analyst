@@ -16,7 +16,26 @@ leakage scanner), a domain-aware **eval harness**, full **observability**
 
 ---
 
-## Status: Milestone M5 (optimized + measured) ✅
+## Results (measured, synthetic data, `gpt-4o-mini`)
+
+| Metric | Value |
+|---|---|
+| **Result-set accuracy** (vs gold SQL, 20 cases) | **~60–65%** (`m5-v1`, up from ~40–50% `m2-v1`: **+15–20 pts**) |
+| **Self-correction recovery** | up to **3/3** first-attempt errors rescued |
+| **LLM-judge faithfulness** | mean **~4.1/5**, validated at **Cohen's κ = 1.0** vs human labels (target ≥ 0.70) |
+| **PHI leakage** | **0**, enforced in code + CI |
+| **Cost / query** | **~$0.0004** · **p95 latency** ~6–10 s |
+
+**The PHI-safe story (the scarce signal):** a de-identified-views boundary, a
+least-privilege DB role that **physically cannot read base tables or the date-shift key**,
+an **append-only access audit** (separate INSERT-only writer + no-mutate trigger), a
+**no-PHI-to-model** regime (input/output scanned; row-level `SELECT *` and raw surrogate
+keys refused), and an automated **leakage scanner that asserts zero** — all demonstrated
+on synthetic data, all real code. See *Methodology & safety architecture* below.
+
+---
+
+## Status: Milestone M6 (shipped: UI · CI gate · writeup) ✅
 
 - **M0 — skeleton:** repo scaffold (§7), pinned deps, Docker Compose (self-hosted
   Langfuse v3 stack + Postgres + app), Synthea→SQLite loader, FastAPI `/health` +
@@ -61,12 +80,16 @@ leakage scanner), a domain-aware **eval harness**, full **observability**
   PHI leakage still 0. Remaining misses (rate phrasing, per-patient subqueries, window
   functions, exact code-based cohorts) are documented levers for model-routing / few-shot.
 
+- **M6 — ship:** a minimal **demo UI** at `GET /` (question → `/ask`, renders answer, SQL,
+  cost, audit id, trace link), a **CI quality + PHI gate** (`.github/workflows/eval.yml`:
+  every PR runs lint + the PHI-control/leakage/guard tests; an opt-in `full-eval` job spins
+  a Postgres service, bootstraps the views, and fails on accuracy regression *or* any
+  leakage), a deploy blueprint (`render.yaml`), and this metrics-first writeup.
+
 The PHI controls are layered defense-in-depth — the **DB grant is the primary control**
 (the agent's role physically cannot read a base table), with code-level guards
 (`assert_views_only`, `assert_aggregate_shape`, `assert_safe_output_columns`) as a fast,
 structured second line.
-
-Not yet built (deliberately): the CI gate + deploy + writeup (M6).
 
 ### Verified end-to-end (M2)
 
@@ -182,6 +205,60 @@ docker compose up -d --build         # brings up the app too (on :8000)
 pytest          # hermetic unit/smoke tests (no network, no LLM key)
 ruff check .
 ```
+
+---
+
+## Methodology & safety architecture
+
+**Eval methodology (why the numbers are credible).** The primary scorer is a
+*deterministic result-set match*: the runner executes both the gold SQL and the agent's
+SQL against the de-identified views and compares the result sets order- and
+precision-normalized — the agent **never sees `gold_sql`**, only the view schema and the
+question. Alongside it: execution-success, self-correction recovery, and a PHI-leakage
+count. The secondary scorer is an **LLM judge** of answer faithfulness — and because a
+judge is itself a model output, it is **validated against human labels** (Cohen's κ on
+the binary faithful decision; κ = 1.0 here, target ≥ 0.70). A useful, honest finding:
+faithfulness and correctness **decouple** — the agent often *faithfully* reports a
+*wrong-SQL* result — which is exactly why result-set match is the primary metric and
+where optimization (M5) was aimed.
+
+**PHI-safe architecture (the scarce signal), in layers:**
+1. **Classification** — every base column tagged IDENTIFIER / QUASI / ANALYTIC against the
+   HIPAA Safe Harbor 18 identifiers (ages > 89 bucketed to 90+).
+2. **De-identified views** — `v_*` views drop identifiers and transform quasi-identifiers
+   (age → band, dates → per-patient *shifted* year, ZIP → 3-digit). The shift preserves
+   within-patient intervals (so readmission/LOS still work) without absolute dates.
+3. **Least-privilege role** — the agent connects as `analyst_ro`: `SELECT` on the views
+   *only*, `default_transaction_read_only`, a statement timeout, and an explicit `REVOKE`
+   on base tables **and on `patient_date_offset`** (reading the offset would let an
+   attacker reverse the shift — the key re-identification vector). This is the **primary**
+   control; the agent physically cannot reach PHI.
+4. **No-PHI-to-model** — `schema_inspect` exposes only the view schema; code guards reject
+   non-SELECT, base-table/system-catalog references, bare `SELECT *`, and results that
+   expose a raw surrogate key (one row per individual).
+5. **De-id boundary + leakage scanner** — every model input and output crosses a scrubber
+   and a high-precision identifier scanner that **asserts zero leakage** (a hard failure),
+   enforced in tests + CI.
+6. **Append-only audit** — every execution writes one immutable row (request id, SQL, views,
+   row count, outcome) via a *separate INSERT-only* role, with a no-UPDATE/DELETE trigger.
+
+## Deploy
+
+The app is a stateless container; production needs a **managed Postgres** (bootstrap the
+views into it once), **Langfuse** (self-hosted or [Cloud](https://cloud.langfuse.com)),
+and an `OPENAI_API_KEY`. A Render blueprint is in [`render.yaml`](./render.yaml); the
+container honors `$PORT`.
+
+```bash
+# 1. Provision managed Postgres + set the DSNs/role passwords + Langfuse + OPENAI_API_KEY
+#    as service env vars (see render.yaml / .env.example). Then, once, against that DB:
+DATA_BACKEND=postgres python -m src.data.bootstrap_pg   # creates views, analyst_ro, audit
+# 2. Deploy the Docker service (Render/Fly/any container host). Health check: GET /health.
+# 3. Open the service URL → the demo UI at GET /.
+```
+
+The reachable URL is the operator's step (it needs your cloud account + secrets); the repo
+is deploy-ready and runs end-to-end locally via `docker compose up -d --build`.
 
 ---
 

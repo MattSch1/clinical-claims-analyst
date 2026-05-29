@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root for `from src...`
 
 import json  # noqa: E402
+import os  # noqa: E402
 import statistics  # noqa: E402
 import time  # noqa: E402
 from datetime import UTC, datetime  # noqa: E402
@@ -153,6 +154,19 @@ def main() -> int:
         f"${report['mean_cost_usd']:.5f}/query | PHI leakage {report['phi_leakage_count']} ==="
     )
     print(f"report: eval/reports/{stamp}.md")
+
+    # CI gate: fail on ANY PHI leakage, or accuracy below the floor (baseline - margin).
+    # EVAL_MIN_ACCURACY defaults to 0 (no accuracy gate locally); CI sets it explicitly.
+    floor = float(os.getenv("EVAL_MIN_ACCURACY", "0") or "0")
+    if report["phi_leakage_count"] > 0:
+        print(f"GATE FAIL: PHI leakage = {report['phi_leakage_count']} (must be 0)")
+        return 1
+    if report["result_set_accuracy"] < floor:
+        print(
+            f"GATE FAIL: result-set accuracy {report['result_set_accuracy']:.0%} "
+            f"< floor {floor:.0%}"
+        )
+        return 1
     return 0
 
 

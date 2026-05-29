@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Clinical &amp; Claims Analyst</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1419; color: #e6edf3;
+    }
+    .wrap { max-width: 820px; margin: 0 auto; padding: 32px 20px 64px; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .sub { color: #8b949e; margin: 0 0 24px; font-size: 13px; }
+    .sub b { color: #58a6ff; font-weight: 600; }
+    textarea {
+      width: 100%; min-height: 64px; resize: vertical; padding: 12px 14px; border-radius: 10px;
+      border: 1px solid #30363d; background: #161b22; color: #e6edf3; font: inherit;
+    }
+    .row { display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+    button {
+      background: #238636; color: #fff; border: 0; border-radius: 8px; padding: 9px 18px;
+      font-weight: 600; cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: default; }
+    .chips { margin: 14px 0 0; display: flex; gap: 8px; flex-wrap: wrap; }
+    .chip {
+      font-size: 12px; color: #adbac7; background: #21262d; border: 1px solid #30363d;
+      border-radius: 999px; padding: 5px 11px; cursor: pointer;
+    }
+    .chip:hover { border-color: #58a6ff; color: #58a6ff; }
+    .card {
+      margin-top: 22px; background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+      padding: 18px 20px; display: none;
+    }
+    .answer { font-size: 16px; }
+    pre {
+      background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px;
+      overflow-x: auto; font-size: 13px; color: #79c0ff; white-space: pre-wrap;
+    }
+    .meta { display: flex; gap: 16px; flex-wrap: wrap; color: #8b949e; font-size: 12px; margin-top: 12px; }
+    .meta b { color: #e6edf3; font-weight: 600; }
+    a { color: #58a6ff; }
+    .err { color: #f85149; }
+    .note { color: #8b949e; font-size: 12px; margin-top: 10px; }
+    .badge { color: #3fb950; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Clinical &amp; Claims Analyst</h1>
+    <p class="sub">
+      Ask a population-analytics question over a <b>synthetic</b> claims + clinical dataset.
+      The agent plans, writes SQL against <b>de-identified views</b>, self-corrects, and answers —
+      PHI-safe, audited, and traced. No individual records are ever returned.
+    </p>
+
+    <textarea id="q" placeholder="e.g. What is the average total claim cost per encounter, by encounter class?"></textarea>
+    <div class="row">
+      <button id="ask">Ask</button>
+      <span id="status" class="note"></span>
+    </div>
+
+    <div class="chips" id="chips"></div>
+
+    <div class="card" id="card">
+      <div class="answer" id="answer"></div>
+      <pre id="sql"></pre>
+      <div class="meta" id="meta"></div>
+      <a id="trace" target="_blank" rel="noopener"></a>
+    </div>
+  </div>
+
+  <script>
+    const EXAMPLES = [
+      "How many patients are in the dataset?",
+      "What is the average total claim cost per encounter, by encounter class?",
+      "What is the gender distribution of patients?",
+      "What percentage of encounters had no insurance coverage?",
+      "What are the 10 most frequently recorded conditions?",
+    ];
+    const q = document.getElementById("q");
+    const chips = document.getElementById("chips");
+    EXAMPLES.forEach(text => {
+      const c = document.createElement("span");
+      c.className = "chip"; c.textContent = text;
+      c.onclick = () => { q.value = text; q.focus(); };
+      chips.appendChild(c);
+    });
+
+    const btn = document.getElementById("ask");
+    const statusEl = document.getElementById("status");
+    const card = document.getElementById("card");
+    const answerEl = document.getElementById("answer");
+    const sqlEl = document.getElementById("sql");
+    const metaEl = document.getElementById("meta");
+    const traceEl = document.getElementById("trace");
+
+    async function ask() {
+      const question = q.value.trim();
+      if (!question) return;
+      btn.disabled = true; statusEl.textContent = "thinking…"; card.style.display = "none";
+      try {
+        const res = await fetch("/ask", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ question }),
+        });
+        const d = await res.json();
+        answerEl.className = "answer";
+        answerEl.textContent = d.answer || "(no answer)";
+        sqlEl.style.display = d.sql ? "block" : "none";
+        sqlEl.textContent = d.sql || "";
+        const bits = [];
+        if (d.row_count != null) bits.push(`<b>${d.row_count}</b> rows`);
+        if (d.latency_ms != null) bits.push(`<b>${Math.round(d.latency_ms)}</b> ms`);
+        if (d.cost_usd != null) bits.push(`$<b>${Number(d.cost_usd).toFixed(5)}</b>`);
+        if (d.model) bits.push(`model <b>${d.model}</b>`);
+        if (d.audit_id != null) bits.push(`audit <b>#${d.audit_id}</b>`);
+        bits.push(`<span class="badge">PHI leakage ${d.leakage_count ?? 0}</span>`);
+        metaEl.innerHTML = bits.join(" · ");
+        if (d.trace_url) { traceEl.href = d.trace_url; traceEl.textContent = "open Langfuse trace ↗"; }
+        else { traceEl.removeAttribute("href"); traceEl.textContent = ""; }
+        card.style.display = "block";
+      } catch (e) {
+        answerEl.className = "answer err";
+        answerEl.textContent = "Request failed: " + e;
+        sqlEl.style.display = "none"; metaEl.innerHTML = ""; traceEl.textContent = "";
+        card.style.display = "block";
+      } finally {
+        btn.disabled = false; statusEl.textContent = "";
+      }
+    }
+    btn.onclick = ask;
+    q.addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) ask(); });
+  </script>
+</body>
+</html>

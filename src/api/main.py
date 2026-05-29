@@ -14,9 +14,11 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from src.agent.graph import run_agent
@@ -39,10 +41,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Clinical & Claims Analyst Agent",
-    version="0.2.0",
+    version="0.6.0",
     description=(
-        "PHI-safe text-to-analytics over synthetic claims+clinical data. "
-        "Milestone M1 (agent loop over SQLite)."
+        "PHI-safe text-to-analytics over a synthetic claims+clinical dataset. The agent "
+        "plans, writes SQL against de-identified views, self-corrects, and answers — "
+        "audited, traced, leakage-scanned. JSON in/out; demo UI at /."
     ),
     lifespan=lifespan,
 )
@@ -69,13 +72,27 @@ class AskResponse(BaseModel):
     note: str | None = None
 
 
+_UI_INDEX = Path(__file__).resolve().parents[2] / "ui" / "index.html"
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def index() -> object:
+    """Minimal demo UI (JSON API is the source of truth; this is just a client)."""
+    if _UI_INDEX.exists():
+        return FileResponse(_UI_INDEX)
+    return HTMLResponse(
+        "<h1>Clinical &amp; Claims Analyst</h1>"
+        "<p>Demo UI not found. POST JSON to <code>/ask</code> or see <code>/docs</code>.</p>"
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     return {
         "status": "ok",
         "service": settings.app_name,
-        "version": "0.2.0",
-        "milestone": "M2",
+        "version": "0.6.0",
+        "milestone": "M6",
         "data_backend": settings.data_backend,
         "llm_configured": settings.llm_ready,
         "langfuse_configured": settings.langfuse_ready,

@@ -1,0 +1,42 @@
+# Render blueprint (deploy template). The app is a stateless Docker web service; it needs
+# a managed Postgres (bootstrap the de-identified views into it once) + Langfuse (self-host
+# or Langfuse Cloud) + an OpenAI key. Secrets are `sync: false` — set them in the dashboard;
+# never commit real values. After first deploy, run `python -m src.data.bootstrap_pg`
+# against the managed DB (a one-off job or `render exec`) to create the views/role/audit.
+services:
+  - type: web
+    name: clinical-claims-analyst
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: DATA_BACKEND
+        value: postgres
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ANALYTICS_OWNER_DSN
+        sync: false
+      - key: ANALYST_RO_DSN
+        sync: false
+      - key: AUDIT_WRITER_DSN
+        sync: false
+      - key: ANALYST_RO_PASSWORD
+        sync: false
+      - key: AUDIT_WRITER_PASSWORD
+        sync: false
+      # Langfuse Cloud (or your self-hosted instance):
+      - key: LANGFUSE_HOST
+        sync: false
+      - key: LANGFUSE_PUBLIC_URL
+        sync: false
+      - key: LANGFUSE_PUBLIC_KEY
+        sync: false
+      - key: LANGFUSE_SECRET_KEY
+        sync: false
+      - key: LANGFUSE_PROJECT_ID
+        sync: false
+
+databases:
+  - name: clinical-claims-analytics
+    plan: free
