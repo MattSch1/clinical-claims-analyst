@@ -7,7 +7,7 @@ read-only role can reach). The SQLite backend is now test-only.
 
 from __future__ import annotations
 
-PROMPT_VERSION = "m2-v1"
+PROMPT_VERSION = "m5-v1"
 
 # Shared dialect/safety rules injected into the SQL prompts.
 _SQL_RULES = """\
@@ -23,7 +23,17 @@ Rules for the SQL you write:
   Prefer the views' pre-transformed columns where they exist (age, age_band,
   encounter_year, start_year, onset_year, los_days, zip3) over raw dates.
 - Alias output columns with clear names; round money/rates to 2-4 decimals.
-- Use only views and columns that appear in the provided schema."""
+- Use only views and columns that appear in the provided schema.
+- For "most frequent / most common / top N" questions about conditions, medications, or
+  procedures, GROUP BY and return the human-readable `description` column — NOT the
+  numeric `code`.
+- To report a payer, JOIN v_payers ON the view's `payer` = v_payers.`id` and select
+  v_payers.`name`; do not group by the raw payer id.
+- Match the requested UNIT exactly: "per 1,000" multiplies by 1000.0; a "percentage" or
+  "share" multiplies by 100; never report a raw count when a rate is asked.
+- Codes use standard systems (SNOMED conditions/procedures, LOINC observations, RxNorm
+  medications, CVX immunizations). If you don't know a specific code, filter by
+  `description ILIKE '%term%'` instead of guessing a code."""
 
 PLAN_PROMPT_V1 = """\
 You are a careful clinical and claims data analyst. Given a question and the available

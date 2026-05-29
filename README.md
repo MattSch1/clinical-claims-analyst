@@ -16,7 +16,7 @@ leakage scanner), a domain-aware **eval harness**, full **observability**
 
 ---
 
-## Status: Milestone M4 (validated LLM judge) ✅
+## Status: Milestone M5 (optimized + measured) ✅
 
 - **M0 — skeleton:** repo scaffold (§7), pinned deps, Docker Compose (self-hosted
   Langfuse v3 stack + Postgres + app), Synthea→SQLite loader, FastAPI `/health` +
@@ -53,12 +53,20 @@ leakage scanner), a domain-aware **eval harness**, full **observability**
   The judge (faithfulness) and result-set match (correctness) **decouple** — the agent
   often *faithfully* reports a *wrong-SQL* result — which is precisely the M5 target.
 
+- **M5 — optimize + measure:** one lever — **prompt revision** (`m5-v1`): prefer
+  `description` over `code` for top-N questions, JOIN `v_payers` for payer names, honor
+  the requested rate unit, and `ILIKE` on description when a code is unknown.
+  **Result-set accuracy ~40–50% (`m2-v1`) → ~60–65% (`m5-v1`)** — a **+15–20 point** gain
+  at equal cost (~$0.0004/query), lower p95 latency (~15 s → ~6–10 s), recovery 3/3, and
+  PHI leakage still 0. Remaining misses (rate phrasing, per-patient subqueries, window
+  functions, exact code-based cohorts) are documented levers for model-routing / few-shot.
+
 The PHI controls are layered defense-in-depth — the **DB grant is the primary control**
 (the agent's role physically cannot read a base table), with code-level guards
 (`assert_views_only`, `assert_aggregate_shape`, `assert_safe_output_columns`) as a fast,
 structured second line.
 
-Not yet built (deliberately): optimization (M5) and the CI gate + deploy (M6).
+Not yet built (deliberately): the CI gate + deploy + writeup (M6).
 
 ### Verified end-to-end (M2)
 
