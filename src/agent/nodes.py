@@ -46,9 +46,9 @@ def _run_llm(node: str, system: str, user: str, *, model: str | None = None) -> 
 
     `model` overrides the model for this node (SQL gen/self-correct route to the stronger
     sql_model; plan/synthesize stay on the cheap llm_model). Scans the FULL assembled
-    prompt before sending — the no-PHI-to-model regime requires every model input to pass
-    the leakage scanner, not just the original question. A hit raises LeakageError (a hard
-    failure the caller degrades gracefully on)."""
+    prompt before sending AND the model's output after — the no-PHI-to-model regime
+    requires every model input and output to pass the leakage scanner. A hit raises
+    LeakageError (a hard failure the caller records to state and refuses on)."""
     mdl = model or settings.llm_model
     leakage.assert_clean(user, where=f"{node}:input")
     with tracing.generation(name=node, model=mdl, input=user, tags=["m2", node]) as box:
@@ -63,7 +63,32 @@ def _run_llm(node: str, system: str, user: str, *, model: str | None = None) -> 
             "total": res.total_tokens,
         }
         box["cost_details"] = {"total": res.cost_usd}
+    # Output gate: a hit is a hard failure. The call was already billed, so carry its
+    # cost on the exception — the caller's refusal path still accounts for the spend.
+    out_leaks = leakage.scan_text(res.text, where=f"{node}:output")
+    if out_leaks:
+        exc = leakage.LeakageError(out_leaks)
+        exc.llm_result = res
+        raise exc
     return res
+
+
+_REFUSED_ANSWER = "Answer withheld: a PHI-safety (leakage) check failed."
+
+
+def _leak_update(state: AgentState, node: str, exc: leakage.LeakageError) -> dict:
+    """Record a leakage hit to state as a hard failure (CLAUDE.md: any hit fails the
+    request — it must never be swallowed by a generic node except)."""
+    out = {
+        "leakage_hits": state.leakage_hits + [f"{lk.where}:{lk.kind}" for lk in exc.leaks],
+        "status": "refused",
+        "final_answer": _REFUSED_ANSWER,
+        "step_trace": state.step_trace + [f"{node}: LEAKAGE -> refused"],
+    }
+    res = getattr(exc, "llm_result", None)  # set when the hit was on a (billed) OUTPUT
+    if res is not None:
+        out.update(_acc(state, res))
+    return out
 
 
 def _render_result(result: dict, max_rows: int = 50) -> str:
@@ -105,9 +130,11 @@ def _sql_update(
         cols = ", ".join(sorted({lk.match for lk in leaks}))
         out["execution_error"] = f"query references restricted identifier column(s): {cols}"
         out["leakage_hits"] = state.leakage_hits + [f"sql:{lk.match}" for lk in leaks]
+        out["sql_leak_blocked"] = True
         out["step_trace"] = state.step_trace + [f"{node}: LEAKAGE blocked id column(s) {cols}"]
     else:
         out["execution_error"] = None
+        out["sql_leak_blocked"] = False
         out["step_trace"] = state.step_trace + [f"{node}: {_clip(sql)}"]
     if extra:
         out.update(extra)
@@ -138,6 +165,8 @@ def plan(state: AgentState) -> dict:
             "step_trace": state.step_trace + [f"plan: {_clip(res.text)}"],
             **_acc(state, res),
         }
+    except leakage.LeakageError as exc:
+        return {"schema_snapshot": schema, "plan": None, **_leak_update(state, "plan", exc)}
     except Exception as exc:  # noqa: BLE001 - never let a node crash the request
         logger.warning("plan node failed", exc_info=True)
         return {
@@ -162,7 +191,7 @@ def resolve_codes(state: AgentState) -> dict:
     """Resolve named clinical concepts (e.g. 'Type 2 diabetes') to the EXACT codes present
     in the data via a description lookup — so the agent uses the real SNOMED/LOINC code
     rather than guessing a coding system. No-op on the SQLite backend / when no concept."""
-    if not settings.use_postgres:
+    if not settings.use_postgres or state.status == "refused":
         return {"code_hints": None}
     try:
         res = _run_llm(
@@ -176,6 +205,8 @@ def resolve_codes(state: AgentState) -> dict:
             "step_trace": state.step_trace + [note],
             **_acc(state, res),
         }
+    except leakage.LeakageError as exc:
+        return {"code_hints": None, **_leak_update(state, "resolve_codes", exc)}
     except Exception as exc:  # noqa: BLE001
         logger.warning("resolve_codes failed", exc_info=True)
         note = f"resolve_codes failed: {exc}"
@@ -183,6 +214,8 @@ def resolve_codes(state: AgentState) -> dict:
 
 
 def generate_sql(state: AgentState) -> dict:
+    if state.status == "refused":
+        return {}
     schema = state.schema_snapshot or tools.schema_inspect()
     hints = f"\n\n{state.code_hints}" if state.code_hints else ""
     user = (
@@ -196,6 +229,8 @@ def generate_sql(state: AgentState) -> dict:
         )
         sql = tools.extract_sql(res.text)
         return {**_sql_update(state, res, sql, "generate_sql")}
+    except leakage.LeakageError as exc:
+        return {"candidate_sql": None, **_leak_update(state, "generate_sql", exc)}
     except Exception as exc:  # noqa: BLE001
         logger.warning("generate_sql node failed", exc_info=True)
         return {
@@ -207,31 +242,52 @@ def generate_sql(state: AgentState) -> dict:
 
 def execute_sql(state: AgentState) -> dict:
     sql = state.candidate_sql
-    if not sql:
+    if state.status == "refused" or not sql:
         return {
             "execution_result": None,
             "execution_error": state.execution_error or "no SQL to execute",
             "step_trace": state.step_trace + ["execute_sql: skipped (no SQL)"],
         }
-    with tracing.tool(name="sql_execute", input=sql) as box:
-        # guarded, read-only, audited (one audit row per outcome); never raises
-        result = tools.sql_execute(sql, request_id=state.request_id)
-        audit_id = result.get("audit_id")
-        if "error" in result:
-            box["output"] = {"error": result["error"], "audit_id": audit_id}
-            return {
-                "execution_result": None,
-                "execution_error": result["error"],
-                "audit_id": audit_id,
-                "step_trace": state.step_trace + [f"execute_sql error: {_clip(result['error'])}"],
-            }
-        box["output"] = {"row_count": result["row_count"], "columns": result["columns"]}
-        ok_note = f"execute_sql: {result['row_count']} rows (audit {audit_id})"
+    if state.sql_leak_blocked:
+        # The SQL leakage scan flagged an identifier column. A flagged query must NEVER
+        # run — record the refused attempt to the audit trail and let validate route to
+        # self-correction. (Gated on the leakage flag, NOT a bare execution_error, so a
+        # stale DB error from a failed self_correct isn't mislabeled as a policy rejection.)
+        audit_id = tools.audit_blocked(sql, state.request_id, state.execution_error)
         return {
-            "execution_result": result,
-            "execution_error": None,
+            "execution_result": None,
             "audit_id": audit_id,
-            "step_trace": state.step_trace + [ok_note],
+            "step_trace": state.step_trace
+            + [f"execute_sql: BLOCKED pre-execution (audit {audit_id})"],
+        }
+    try:
+        with tracing.tool(name="sql_execute", input=sql) as box:
+            # guarded, read-only, audited (one audit row per outcome); never raises
+            result = tools.sql_execute(sql, request_id=state.request_id)
+            audit_id = result.get("audit_id")
+            if "error" in result:
+                box["output"] = {"error": result["error"], "audit_id": audit_id}
+                return {
+                    "execution_result": None,
+                    "execution_error": result["error"],
+                    "audit_id": audit_id,
+                    "step_trace": state.step_trace
+                    + [f"execute_sql error: {_clip(result['error'])}"],
+                }
+            box["output"] = {"row_count": result["row_count"], "columns": result["columns"]}
+            ok_note = f"execute_sql: {result['row_count']} rows (audit {audit_id})"
+            return {
+                "execution_result": result,
+                "execution_error": None,
+                "audit_id": audit_id,
+                "step_trace": state.step_trace + [ok_note],
+            }
+    except Exception as exc:  # noqa: BLE001 - e.g. a tracing-SDK failure must not 500
+        logger.warning("execute_sql node failed", exc_info=True)
+        return {
+            "execution_result": None,
+            "execution_error": f"execute_sql failed: {exc}",
+            "step_trace": state.step_trace + [f"execute_sql failed: {exc}"],
         }
 
 
@@ -239,7 +295,9 @@ def validate(state: AgentState) -> dict:
     """Branch node: decide self_correct vs synthesize (sets state.route)."""
     err = state.execution_error
     rows = state.row_count
-    if err is None and _has_data(state.execution_result):
+    if state.status == "refused":
+        route, status = "synthesize", "refused"  # PHI refusal is final — never retried
+    elif err is None and _has_data(state.execution_result):
         route, status = "synthesize", ("recovered" if state.retry_count > 0 else "ok")
     elif state.retry_count >= MAX_RETRIES:
         route, status = "synthesize", ("failed" if err else "empty")
@@ -253,6 +311,8 @@ def validate(state: AgentState) -> dict:
 
 
 def self_correct(state: AgentState) -> dict:
+    if state.status == "refused":
+        return {"retry_count": state.retry_count + 1}
     schema = state.schema_snapshot or tools.schema_inspect()
     # Scrub the DB error before it enters a prompt — it's the one prompt input not
     # produced by the de-identified views and could echo a literal from the query.
@@ -274,6 +334,11 @@ def self_correct(state: AgentState) -> dict:
             state, res, sql, f"self_correct #{state.retry_count + 1}",
             extra={"retry_count": state.retry_count + 1},
         )
+    except leakage.LeakageError as exc:
+        return {
+            "retry_count": state.retry_count + 1,
+            **_leak_update(state, "self_correct", exc),
+        }
     except Exception as exc:  # noqa: BLE001
         logger.warning("self_correct node failed", exc_info=True)
         return {
@@ -283,6 +348,13 @@ def self_correct(state: AgentState) -> dict:
 
 
 def synthesize(state: AgentState) -> dict:
+    if state.status == "refused":
+        # A PHI refusal upstream is final — keep the withheld answer, never overwrite it.
+        return {
+            "final_answer": state.final_answer or _REFUSED_ANSWER,
+            "status": "refused",
+            "step_trace": state.step_trace + ["synthesize: upheld refusal"],
+        }
     if _has_data(state.execution_result):
         user = (
             f"Question: {state.question}\n\nSQL that was run:\n{state.candidate_sql}\n\n"
@@ -292,17 +364,6 @@ def synthesize(state: AgentState) -> dict:
         try:
             res = _run_llm("synthesize", prompts.SYNTHESIZE_PROMPT_V1, user)
             answer = res.text.strip()
-            # Output leakage gate: an identifier in the answer is a HARD failure (not a
-            # silent redaction) — refuse the answer. On synthetic aggregates it never fires.
-            out_leaks = leakage.scan_text(answer, where="synthesize:output")
-            if out_leaks:
-                return {
-                    "final_answer": "Answer withheld: a PHI-safety (leakage) check failed.",
-                    "status": "refused",
-                    "leakage_hits": state.leakage_hits + [f"output:{lk.kind}" for lk in out_leaks],
-                    "step_trace": state.step_trace + ["synthesize: OUTPUT leakage -> refused"],
-                    **_acc(state, res),
-                }
             status = state.status if state.status in ("ok", "recovered") else "ok"
             return {
                 "final_answer": answer,
@@ -310,11 +371,23 @@ def synthesize(state: AgentState) -> dict:
                 "step_trace": state.step_trace + ["synthesize: answered"],
                 **_acc(state, res),
             }
+        except leakage.LeakageError as exc:
+            # Input (result rows) or output (answer) tripped the gate — a HARD failure
+            # (not a silent redaction): refuse the answer and record the hits.
+            return _leak_update(state, "synthesize", exc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("synthesize node failed; using templated answer", exc_info=True)
             fb = _fallback_answer(state)
-            if leakage.scan_text(fb):  # gate the templated fallback too
-                fb = "Answer withheld: a PHI-safety check failed on the result."
+            fb_leaks = leakage.scan_text(fb, where="synthesize:fallback")
+            if fb_leaks:  # gate the templated fallback too — and ACCOUNT for the hit
+                return {
+                    "final_answer": _REFUSED_ANSWER,
+                    "status": "refused",
+                    "leakage_hits": state.leakage_hits
+                    + [f"output:{lk.kind}" for lk in fb_leaks],
+                    "step_trace": state.step_trace
+                    + ["synthesize: fallback OUTPUT leakage -> refused"],
+                }
             return {
                 "final_answer": fb,
                 "status": "ok",

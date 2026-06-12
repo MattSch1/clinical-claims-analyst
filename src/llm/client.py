@@ -73,6 +73,9 @@ def complete(
         "temperature": temperature,
         "max_tokens": max_tokens,
         "metadata": metadata or {},
+        # A hung provider call must not pin a worker indefinitely (LiteLLM raises
+        # litellm.Timeout, which the agent nodes degrade gracefully on).
+        "timeout": settings.llm_timeout,
     }
     if mock is not None:
         call_kwargs["mock_response"] = mock
@@ -80,6 +83,15 @@ def complete(
     t0 = time.perf_counter()
     resp = litellm.completion(**call_kwargs)
     latency_ms = (time.perf_counter() - t0) * 1000.0
+
+    finish_reason = getattr(resp.choices[0], "finish_reason", None)
+    if finish_reason == "length":
+        # A truncated completion is NOT a usable answer (half a SQL statement parses as
+        # garbage); fail loudly so the caller's error path / self-correction handles it.
+        raise RuntimeError(
+            f"LLM response truncated at max_tokens={max_tokens} (finish_reason=length); "
+            "raise LLM_MAX_TOKENS if this recurs"
+        )
 
     text = (resp.choices[0].message.content or "").strip()
     usage = getattr(resp, "usage", None)

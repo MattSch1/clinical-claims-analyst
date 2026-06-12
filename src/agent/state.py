@@ -33,6 +33,7 @@ class AgentState(BaseModel):
     # PHI controls (M2)
     audit_id: int | None = None                  # access_audit row id for this execution
     leakage_hits: list[str] = Field(default_factory=list)  # any model-I/O leakage findings
+    sql_leak_blocked: bool = False               # current SQL was flagged by the leakage scan
 
     # Outputs
     final_answer: str | None = None

@@ -31,3 +31,15 @@ def test_global_daily_cap():
     assert not ok and "daily" in reason
     # the rolling 24h window resets
     assert rl.check("d", now=86_400.0 + 3)[0]
+
+
+def test_prune_keeps_callers_own_bucket():
+    """The periodic stale-IP sweep must not rebind the caller's key: the caller's request
+    is recorded under their own IP, and a pruned IP is not resurrected."""
+    rl = RateLimiter(per_minute=1)
+    rl.check("stale", now=0.0)                 # seed an entry that will age out
+    rl._checks = rl._PRUNE_EVERY - 1           # next check triggers the prune sweep
+    assert rl.check("caller", now=200.0)[0]    # stale (>60s old) is pruned this call
+    # caller's hit landed in caller's bucket (not the pruned IP's) → 2nd hit is limited
+    assert not rl.check("caller", now=200.5)[0]
+    assert "stale" not in rl._ip_hits          # pruned and not resurrected

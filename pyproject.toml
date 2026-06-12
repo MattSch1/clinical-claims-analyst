@@ -27,6 +27,9 @@ dependencies = [
     # Postgres driver (M2). Pure-Python; the [binary] extra ships precompiled libpq
     # (no system libpq/pg_config); zero pydantic dependency. Not psycopg2.
     "psycopg[binary]==3.3.4",
+    # Connection pooling — managed-PG (Neon) TLS handshakes are ~100ms+; a pool with
+    # health-checked checkouts amortizes that across requests.
+    "psycopg-pool==3.3.1",
     # Agent orchestration — pinned now (declared dependency), first used in M1.
     # langchain-core is pinned to the floor langgraph 1.2.2 requires; let pip
     # resolve langgraph-checkpoint / langgraph-prebuilt from langgraph's own pins.

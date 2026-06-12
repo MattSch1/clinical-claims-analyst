@@ -12,6 +12,7 @@ On the SQLite test backend, record_access is a no-op so the unit tests stay herm
 from __future__ import annotations
 
 import logging
+import threading
 
 from src.config import get_settings
 
@@ -32,11 +33,12 @@ CREATE TABLE IF NOT EXISTS access_audit (
 );
 """
 
-# Enforce append-only at the engine: any UPDATE/DELETE raises.
+# Enforce append-only at the engine: any UPDATE/DELETE raises, and TRUNCATE (which a
+# row-level trigger does NOT intercept) is blocked by a statement-level trigger.
 ACCESS_AUDIT_GUARD_DDL = """
 CREATE OR REPLACE FUNCTION access_audit_no_mutate() RETURNS trigger AS $fn$
 BEGIN
-    RAISE EXCEPTION 'access_audit is append-only (no UPDATE/DELETE allowed)';
+    RAISE EXCEPTION 'access_audit is append-only (no UPDATE/DELETE/TRUNCATE allowed)';
 END;
 $fn$ LANGUAGE plpgsql;
 
@@ -44,6 +46,11 @@ DROP TRIGGER IF EXISTS trg_access_audit_no_mutate ON access_audit;
 CREATE TRIGGER trg_access_audit_no_mutate
     BEFORE UPDATE OR DELETE ON access_audit
     FOR EACH ROW EXECUTE FUNCTION access_audit_no_mutate();
+
+DROP TRIGGER IF EXISTS trg_access_audit_no_truncate ON access_audit;
+CREATE TRIGGER trg_access_audit_no_truncate
+    BEFORE TRUNCATE ON access_audit
+    FOR EACH STATEMENT EXECUTE FUNCTION access_audit_no_mutate();
 """
 
 _INSERT = (
@@ -71,12 +78,35 @@ def record_access(
         logger.warning("audit: AUDIT_WRITER_DSN unset; skipping audit write")
         return None
     try:
-        import psycopg
-
-        with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+        with _writer_pool(dsn).connection() as conn, conn.cursor() as cur:
             cur.execute(_INSERT, (request_id, sql_text, tables, row_count, outcome, error))
             row = cur.fetchone()
             return int(row[0]) if row else None
-    except Exception:  # noqa: BLE001 - audit must never break the request
-        logger.warning("audit write failed (non-fatal)", exc_info=True)
+    except Exception:  # noqa: BLE001 - audit must never raise; the CALLER fails closed
+        # (sql_execute refuses to return results when this comes back None).
+        logger.warning("audit write failed", exc_info=True)
         return None
+
+
+_writer_pools: dict = {}
+_writer_lock = threading.Lock()
+
+
+def _writer_pool(dsn: str):
+    """Small pooled INSERT path (autocommit) for the audit writer."""
+    from psycopg_pool import ConnectionPool
+
+    with _writer_lock:
+        pool = _writer_pools.get(dsn)
+        if pool is None:
+            pool = ConnectionPool(
+                dsn,
+                min_size=0,
+                max_size=2,
+                open=True,
+                check=ConnectionPool.check_connection,
+                kwargs={"autocommit": True},
+                name="audit_writer",
+            )
+            _writer_pools[dsn] = pool
+        return pool

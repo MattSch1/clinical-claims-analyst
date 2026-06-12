@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from functools import lru_cache
 
 from src.config import get_settings
 from src.data import db, pg
@@ -51,16 +50,33 @@ _FIRST_STMT_RE = re.compile(r"(?is)\b(select|with)\b")
 _VIEW_TOKEN_RE = re.compile(r"\bv_[a-z_]+\b", re.IGNORECASE)
 
 
-@lru_cache(maxsize=1)
+_SCHEMA_CACHE: str | None = None
+
+
 def schema_inspect() -> str:
-    """Render the schema the model may use. Cached (static for a given backend)."""
+    """Render the schema the model may use. Successes are cached (the schema is static
+    for a given backend); failures are NOT — a transient DB error must degrade this one
+    request, not poison every request until restart."""
+    global _SCHEMA_CACHE
+    if _SCHEMA_CACHE is not None:
+        return _SCHEMA_CACHE
     if get_settings().use_postgres:
         try:
-            return _schema_inspect_pg()
+            text = _schema_inspect_pg()
         except Exception as exc:  # noqa: BLE001 - degrade, never crash a request
             logger.warning("schema_inspect (postgres) failed", exc_info=True)
             return f"(schema unavailable: {exc})"
-    return _schema_inspect_sqlite()
+    else:
+        text = _schema_inspect_sqlite()
+        if text.startswith("(schema unavailable"):
+            return text
+    _SCHEMA_CACHE = text
+    return text
+
+
+def clear_schema_cache() -> None:
+    global _SCHEMA_CACHE
+    _SCHEMA_CACHE = None
 
 
 def _schema_inspect_pg() -> str:
@@ -136,8 +152,10 @@ def sql_execute(query: str, request_id: str | None = None) -> dict:
         clean = db.assert_select_only(query)
         db.assert_views_only(query)
         db.assert_aggregate_shape(query)
+        db.assert_no_surrogate_output(query)  # pre-exec: no aliased row-level keys
         result = pg.run_select(clean)
         db.assert_safe_output_columns(result["columns"])  # post-exec: no row-level keys
+        db.assert_safe_output_values(result["columns"], result["rows"])  # no UUID dumps
     except db.UnsafeQueryError as exc:
         outcome, error, result = "rejected", f"rejected: {exc}", None  # discard any rows read
     except Exception as exc:  # noqa: BLE001 - DB/driver errors feed self-correction
@@ -146,10 +164,27 @@ def sql_execute(query: str, request_id: str | None = None) -> dict:
     audit_id = audit.record_access(
         request_id, query, tables, (result["row_count"] if result else None), outcome, error
     )
+    if audit_id is None and result is not None:
+        # Fail CLOSED on the audit hard rule: no rows leave sql_execute without an
+        # audit record. (Error paths return nothing sensitive, so they pass through.)
+        logger.error("audit write unavailable — refusing to return query results")
+        return {
+            "error": "audit log unavailable; query refused (fail-closed)",
+            "outcome": "error",
+            "audit_id": None,
+        }
     if result is not None:
         result["audit_id"] = audit_id
         return result
     return {"error": error or "unknown error", "outcome": outcome, "audit_id": audit_id}
+
+
+def audit_blocked(query: str, request_id: str | None, reason: str) -> int | None:
+    """Audit a query that a PRE-execution control blocked (e.g. the SQL leakage scan) —
+    the attempt belongs in the audit trail even though sql_execute never ran it."""
+    if not get_settings().use_postgres:
+        return None
+    return audit.record_access(request_id, query, _view_names(query), None, "rejected", reason)
 
 
 def _sqlite_execute(query: str) -> dict:

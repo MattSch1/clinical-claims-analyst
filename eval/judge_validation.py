@@ -90,7 +90,9 @@ def main() -> int:
         f"[{verdict}] | binary agreement {binary_agreement:.0%} | "
         f"exact 1-5 agreement {exact_hits / n:.0%} ==="
     )
-    return 0
+    # Gate for real: a judge below the agreement target is an unvalidated scorer, and
+    # CI must not treat its numbers as evidence.
+    return 0 if kappa >= TARGET_KAPPA else 1
 
 
 if __name__ == "__main__":

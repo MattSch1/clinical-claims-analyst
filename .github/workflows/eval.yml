@@ -61,7 +61,11 @@ jobs:
       AUDIT_WRITER_DSN: postgresql://audit_writer:audit_writer_ci_pw@127.0.0.1:5433/analytics
       ANALYST_RO_PASSWORD: analyst_ro_ci_pw
       AUDIT_WRITER_PASSWORD: audit_writer_ci_pw
-      EVAL_MIN_ACCURACY: "0.45"   # baseline (~0.60) minus margin; tune as the dataset grows
+      # Match the measured-baseline config (eval/reports 2026-05-29: 88% result-set
+      # accuracy with SQL routed to the strong model) and gate at baseline - 10pt margin
+      # (CI regenerates a smaller 120-patient population, so exact parity isn't expected).
+      SQL_MODEL: gpt-4.1
+      EVAL_MIN_ACCURACY: "0.78"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -77,7 +81,10 @@ jobs:
         run: python -m src.data.load --patients 120 --seed 12345
       - name: Bootstrap de-identified views + least-privilege role + audit
         run: python -m src.data.bootstrap_pg
-      - name: Validate the LLM judge (Cohen's kappa)
-        run: python eval/judge_validation.py
+      # Primary gate first: the deterministic result-set-accuracy + PHI-leakage check is
+      # the signal CI exists to protect, so it runs before the secondary judge gate (a
+      # low-kappa judge run must not fail the build before the primary metric is produced).
       - name: Eval gate (fails on accuracy regression OR any PHI leakage)
         run: python eval/run_eval.py
+      - name: Validate the LLM judge (Cohen's kappa)
+        run: python eval/judge_validation.py

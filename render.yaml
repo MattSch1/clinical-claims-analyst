@@ -1,8 +1,12 @@
-# Render blueprint (deploy template). The app is a stateless Docker web service; it needs
-# a managed Postgres (bootstrap the de-identified views into it once) + Langfuse (self-host
-# or Langfuse Cloud) + an OpenAI key. Secrets are `sync: false` — set them in the dashboard;
-# never commit real values. After first deploy, run `python -m src.data.bootstrap_pg`
-# against the managed DB (a one-off job or `render exec`) to create the views/role/audit.
+# Render blueprint (deploy template). The app is a stateless Docker web service; it
+# needs a managed Postgres (Neon/Supabase free tier — bootstrap the de-identified views
+# into it ONCE from your machine: `python scripts/bootstrap_cloud.py`), Langfuse Cloud
+# (or a self-hosted instance) + an OpenAI key. Secrets are `sync: false` — set them in
+# the dashboard; never commit real values.
+#
+# Deliberately NOT set on the service (bootstrap-only; least privilege — the runtime
+# only ever uses the analyst_ro and audit_writer roles):
+#   ANALYTICS_OWNER_DSN, ANALYST_RO_PASSWORD, AUDIT_WRITER_PASSWORD
 services:
   - type: web
     name: clinical-claims-analyst
@@ -20,17 +24,14 @@ services:
         value: "500"
       - key: OPENAI_API_KEY
         sync: false
-      - key: ANALYTICS_OWNER_DSN
-        sync: false
+      # Managed-PG DSNs for the two LEAST-PRIVILEGE roles the bootstrap created
+      # (append ?sslmode=require for Neon/Supabase):
       - key: ANALYST_RO_DSN
         sync: false
       - key: AUDIT_WRITER_DSN
         sync: false
-      - key: ANALYST_RO_PASSWORD
-        sync: false
-      - key: AUDIT_WRITER_PASSWORD
-        sync: false
-      # Langfuse Cloud (or your self-hosted instance):
+      # Langfuse Cloud (or your self-hosted instance). LANGFUSE_PROJECT_ID must be the
+      # real project id (the cuid in the project URL) or trace links 404.
       - key: LANGFUSE_HOST
         sync: false
       - key: LANGFUSE_PUBLIC_URL
@@ -41,7 +42,3 @@ services:
         sync: false
       - key: LANGFUSE_PROJECT_ID
         sync: false
-
-databases:
-  - name: clinical-claims-analytics
-    plan: free

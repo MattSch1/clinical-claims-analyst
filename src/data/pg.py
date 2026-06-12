@@ -7,10 +7,15 @@ result shape as db.run_select so the agent tooling is backend-agnostic.
 
 from __future__ import annotations
 
-import psycopg
+import threading
+
+from psycopg_pool import ConnectionPool
 
 from src.config import get_settings
 from src.data.db import DEFAULT_ROW_CAP, VIEW_ALLOWLIST
+
+_pools: dict[str, ConnectionPool] = {}
+_pools_lock = threading.Lock()
 
 
 def _ro_dsn() -> str:
@@ -20,10 +25,39 @@ def _ro_dsn() -> str:
     return dsn
 
 
+def _pool(dsn: str) -> ConnectionPool:
+    """One small, health-checked pool per DSN — managed-PG TLS handshakes are expensive,
+    and check=check_connection discards connections the server idled out (Neon suspends)."""
+    with _pools_lock:
+        pool = _pools.get(dsn)
+        if pool is None:
+            pool = ConnectionPool(
+                dsn,
+                min_size=0,
+                max_size=4,
+                open=True,
+                check=ConnectionPool.check_connection,
+                name="analyst_ro",
+            )
+            _pools[dsn] = pool
+        return pool
+
+
+def _connection():
+    return _pool(_ro_dsn()).connection()
+
+
+def ping(timeout: float = 5.0) -> bool:
+    """SELECT 1 over the analyst_ro path (used by /health). Raises on failure."""
+    with _pool(_ro_dsn()).connection(timeout=timeout) as conn:
+        conn.execute("SELECT 1")
+    return True
+
+
 def run_select(sql: str, *, row_cap: int = DEFAULT_ROW_CAP) -> dict:
     """Run already-guarded SQL as analyst_ro. Returns {columns, rows, row_count,
     truncated}. Lets psycopg errors propagate (the caller maps them to {error: ...})."""
-    with psycopg.connect(_ro_dsn()) as conn, conn.cursor() as cur:
+    with _connection() as conn, conn.cursor() as cur:
         cur.execute(sql)
         columns = [d.name for d in cur.description] if cur.description else []
         fetched = cur.fetchmany(row_cap + 1)
@@ -40,7 +74,7 @@ def list_views() -> list[str]:
 def view_columns(view: str) -> list[str]:
     if view not in VIEW_ALLOWLIST:
         return []
-    with psycopg.connect(_ro_dsn()) as conn, conn.cursor() as cur:
+    with _connection() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = 'public' AND table_name = %s ORDER BY ordinal_position",
@@ -63,7 +97,7 @@ def search_codes(words: list[str], *, per_view: int = 5) -> list[tuple[str, str,
     where = " AND ".join("description ILIKE %s" for _ in words)
     params = [f"%{w}%" for w in words]
     out: list[tuple[str, str, str, int]] = []
-    with psycopg.connect(_ro_dsn()) as conn:
+    with _connection() as conn:
         for view in _CODED_VIEWS:
             if view not in VIEW_ALLOWLIST:
                 continue
@@ -87,6 +121,6 @@ def distinct_values(view: str, column: str, *, limit: int = 40) -> list[str]:
         f'SELECT DISTINCT "{column}" FROM "{view}" '
         f'WHERE "{column}" IS NOT NULL ORDER BY 1 LIMIT {int(limit)}'
     )
-    with psycopg.connect(_ro_dsn()) as conn, conn.cursor() as cur:
+    with _connection() as conn, conn.cursor() as cur:
         cur.execute(query)
         return [str(r[0]) for r in cur.fetchall()]

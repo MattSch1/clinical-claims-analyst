@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     sql_model: str = Field(default="", alias="SQL_MODEL")
     llm_temperature: float = Field(default=0.0, alias="LLM_TEMPERATURE")
     llm_max_tokens: int = Field(default=512, alias="LLM_MAX_TOKENS")
+    # Per-call provider timeout (seconds) — a hung call must not pin an API worker.
+    llm_timeout: float = Field(default=60.0, alias="LLM_TIMEOUT")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     # When true, LiteLLM returns a canned response instead of calling the provider.
     # Lets the trace pipeline (and demos / CI) run without a billable key.

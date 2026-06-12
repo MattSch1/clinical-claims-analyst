@@ -17,8 +17,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from src.agent.graph import run_agent
@@ -33,16 +33,42 @@ _limiter = RateLimiter(
     per_minute=settings.rate_limit_per_min, per_day_total=settings.max_queries_per_day
 )
 
+MAX_BODY_BYTES = 64 * 1024  # /ask takes a short question; reject oversized bodies pre-parse
+
 
 def _client_ip(request: Request) -> str:
+    # Render (and CF-fronted hosts) place the real client IP as the FIRST entry of
+    # X-Forwarded-For and control that position, so it isn't client-spoofable; a dedicated
+    # CF-Connecting-IP / True-Client-IP header, when the platform sets it, is even better.
+    for header in ("cf-connecting-ip", "true-client-ip"):
+        val = request.headers.get(header)
+        if val:
+            return val.strip()
     forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:  # behind Render/Fly proxy — first hop is the real client
+    if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail LOUDLY on an impossible configuration — a misconfigured public deploy must
+    # not boot, half-work, and burn tokens answering nothing.
+    if settings.use_postgres:
+        missing = [
+            name
+            for name, val in (
+                ("ANALYST_RO_DSN", settings.analyst_ro_dsn),
+                ("AUDIT_WRITER_DSN", settings.audit_writer_dsn),  # audit is fail-closed
+            )
+            if not val
+        ]
+        if missing:
+            raise RuntimeError(
+                f"DATA_BACKEND=postgres but {', '.join(missing)} not set — refusing to start."
+            )
+    if not settings.llm_ready and not settings.llm_mock:
+        logger.warning("No OPENAI_API_KEY and LLM_MOCK is off — /ask will refuse questions.")
     # Warm the Langfuse client (logs whether tracing is enabled).
     tracing.get_client()
     yield
@@ -60,6 +86,20 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def _limit_body_size(request: Request, call_next):
+    if request.method in ("POST", "PUT", "PATCH"):
+        length = request.headers.get("content-length")
+        if length is None:
+            # No declared length = chunked; we'd have to buffer it to size it. Require a
+            # length instead (legit JSON clients always send one) so the cap can't be
+            # bypassed by a Transfer-Encoding: chunked body.
+            return JSONResponse(status_code=411, content={"detail": "Content-Length required"})
+        if length.isdigit() and int(length) > MAX_BODY_BYTES:
+            return JSONResponse(status_code=413, content={"detail": "request body too large"})
+    return await call_next(request)
 
 
 class AskRequest(BaseModel):
@@ -97,27 +137,59 @@ def index() -> object:
     )
 
 
+_db_health: dict = {"checked": 0.0, "ok": True, "detail": "not checked"}
+_DB_HEALTH_TTL_S = 30.0
+
+
+def _database_health() -> tuple[bool, str]:
+    """Cheap cached SELECT 1 over the analyst_ro path, so /health (and therefore the
+    deploy gate) actually reflects DB reachability instead of env-var presence."""
+    if not settings.use_postgres:
+        return True, "sqlite"
+    now = time.monotonic()
+    if now - _db_health["checked"] < _DB_HEALTH_TTL_S:
+        return _db_health["ok"], _db_health["detail"]
+    from src.data import pg
+
+    try:
+        pg.ping()
+        ok, detail = True, "ok"
+    except Exception as exc:  # noqa: BLE001 - report, don't crash the probe
+        ok, detail = False, f"error: {type(exc).__name__}: {exc}"
+    _db_health.update(checked=now, ok=ok, detail=detail)
+    return ok, detail
+
+
 @app.get("/health")
-def health() -> dict:
-    return {
-        "status": "ok",
+def health() -> object:
+    db_ok, db_detail = _database_health()
+    body = {
+        "status": "ok" if db_ok else "degraded",
         "service": settings.app_name,
         "version": "0.6.0",
         "milestone": "M6",
         "data_backend": settings.data_backend,
+        "database": db_detail,
         "llm_configured": settings.llm_ready,
         "langfuse_configured": settings.langfuse_ready,
         "postgres_configured": settings.pg_ready,
     }
+    if not db_ok:
+        return JSONResponse(status_code=503, content=body)
+    return body
 
 
 @app.post("/ask", response_model=AskResponse)
-def ask(req: AskRequest, request: Request) -> AskResponse:
+def ask(req: AskRequest, request: Request, background_tasks: BackgroundTasks) -> AskResponse:
     # Rate limit BEFORE any model call so a public URL can't drain the key (429).
     if _limiter.enabled:
         allowed, reason = _limiter.check(_client_ip(request), now=time.time())
         if not allowed:
             raise HTTPException(status_code=429, detail=reason)
+
+    # Deliver the trace AFTER the response is sent — flush() blocks for the exporter
+    # timeout when Langfuse is unreachable, and the client shouldn't pay for that.
+    background_tasks.add_task(tracing.flush)
 
     # Without a model (and not mocking), don't pretend — return a clear message.
     if not settings.llm_ready and not settings.llm_mock:
@@ -151,8 +223,6 @@ def ask(req: AskRequest, request: Request) -> AskResponse:
             latency_ms=round((time.perf_counter() - t0) * 1000, 1),
             note=f"agent error: {exc}",
         )
-    finally:
-        tracing.flush()  # deliver the trace before responding (async/buffered)
 
     note = (
         f"status={state.status}; self_corrections={state.retry_count}; "

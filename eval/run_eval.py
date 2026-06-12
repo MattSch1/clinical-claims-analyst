@@ -31,6 +31,7 @@ import scorers  # noqa: E402
 from src.agent.graph import run_agent  # noqa: E402
 from src.agent.prompts import PROMPT_VERSION  # noqa: E402
 from src.config import get_settings  # noqa: E402
+from src.data import db  # noqa: E402
 from src.phi import leakage  # noqa: E402
 
 EVAL_DIR = Path(__file__).resolve().parent
@@ -39,7 +40,13 @@ REPORTS = EVAL_DIR / "reports"
 
 
 def _run_gold(sql_text: str) -> dict:
-    """Execute the trusted gold SQL against the de-identified views (owner connection)."""
+    """Execute the trusted gold SQL against the de-identified views (owner connection).
+
+    "Trusted" is verified, not assumed: gold must be a single SELECT over the v_* views
+    only — a dataset edit that drifted to a base table would otherwise silently run with
+    owner privileges."""
+    db.assert_select_only(sql_text)
+    db.assert_relations_allowlisted(sql_text)
     dsn = get_settings().analytics_owner_dsn
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(sql_text)
@@ -60,6 +67,12 @@ def main() -> int:
     settings = get_settings()
     if not settings.use_postgres:
         print("Eval requires DATA_BACKEND=postgres (the de-identified views). Aborting.")
+        return 2
+    if not settings.audit_writer_dsn:
+        # sql_execute fails closed without an audit writer, so every case would return
+        # 'audit log unavailable' and accuracy would read 0 — fail loud instead (mirrors
+        # the API's startup check) so the gated metric can't be silently zeroed.
+        print("Eval needs AUDIT_WRITER_DSN (sql_execute fails closed without it). Aborting.")
         return 2
 
     cases = [json.loads(line) for line in DATASET.read_text().splitlines() if line.strip()]
@@ -86,10 +99,15 @@ def main() -> int:
             f"answer:{lk.kind}" for lk in leakage.scan_text(state.final_answer or "")
         ]
         # Secondary scorer: LLM judge rates the answer's faithfulness (validated at
-        # kappa via eval/judge_validation.py).
-        verdict = judge.judge_answer(
-            case["question"], state.candidate_sql, agent_result, state.final_answer or ""
-        )
+        # kappa via eval/judge_validation.py). One failed judge call must not abort
+        # the whole run — score 0 (excluded from the mean) and keep going.
+        try:
+            verdict = judge.judge_answer(
+                case["question"], state.candidate_sql, agent_result, state.final_answer or ""
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {case['id']} judge call failed (non-fatal): {exc}")
+            verdict = {"score": 0, "faithful": False, "reason": f"judge error: {exc}"}
         per_case.append({
             "id": case["id"],
             "difficulty": case.get("difficulty"),
